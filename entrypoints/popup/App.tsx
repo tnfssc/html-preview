@@ -153,8 +153,9 @@ export default function App(): React.JSX.Element {
       <form className="section token-form" onSubmit={(event) => void saveToken(event)}>
         <label htmlFor="github-token">Private repository access</label>
         <p>
-          Use a fine-grained token with read-only Contents and Metadata access
-          for selected repositories. Token stays in local extension storage.
+          Use a fine-grained token with read-only Contents, Metadata, and Pull
+          requests access for selected repositories. Token stays in local
+          extension storage.
         </p>
         <input
           id="github-token"

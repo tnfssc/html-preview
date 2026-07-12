@@ -9,7 +9,7 @@ Chrome extension for previewing public and private `.html` and `.htm` files on G
 - **Open full preview** runs repository HTML and JavaScript in a manifest sandbox with no extension API or parent-page access.
 - Pull-request file views get a **Preview** link for changed HTML files. Fork PRs resolve against the fork repository and exact head commit.
 - Public repositories need no credentials.
-- Private access uses an optional fine-grained GitHub token stored only in `chrome.storage.local`. Give it read-only **Contents** and **Metadata** access for selected repositories.
+- Private access uses an optional fine-grained GitHub token stored only in `chrome.storage.local`. Give it read-only **Contents**, **Metadata**, and **Pull requests** access for selected repositories.
 - Executable private previews require a separate explicit opt-in because repository scripts can transmit private content to external servers.
 - Tokens are sent only as `Authorization` headers to `https://api.github.com`; they are never placed in URLs, preview HTML, logs, or release artifacts.
 

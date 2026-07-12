@@ -468,9 +468,20 @@ test('authenticated changes DOM receives HTML source and rich diff controls', as
     expect((await beforeIframe.boundingBox())?.width).toBeLessThanOrEqual(390);
     expect((await afterIframe.boundingBox())?.width).toBeLessThanOrEqual(390);
 
+    await beforeIframe.evaluate((iframe) => {
+      iframe.closest('section')?.style.setProperty('display', 'none');
+    });
     await richContainer.getByRole('button', { name: 'Reload' }).click();
     await expect(richContainer.getByRole('status')).toHaveText(
       'Before and after ready',
+    );
+    await expect(beforeIframe).toBeVisible();
+    await expect(afterIframe).toBeVisible();
+    await expect(beforeIframe.contentFrame().locator('#before-rich')).toHaveText(
+      'Before version',
+    );
+    await expect(afterIframe.contentFrame().locator('#react-rich')).toHaveText(
+      'After version',
     );
     expect(baseFileRequests).toBe(2);
     expect(headFileRequests).toBe(2);

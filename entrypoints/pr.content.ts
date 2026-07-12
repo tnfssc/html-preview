@@ -595,6 +595,7 @@ function insertPreviewControls(
   });
   reloadButton.addEventListener('click', () => {
     if (richState.mode !== 'source') {
+      showRenderedDiff(richState, richState.mode);
       startRender(richState, githubToken, routeState, true);
     }
   });

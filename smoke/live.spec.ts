@@ -1,0 +1,47 @@
+import { test, expect } from '@playwright/test';
+import { launchWithExtension } from '../e2e/extensionHarness';
+
+const blobUrl =
+  'https://github.com/mdn/learning-area/blob/main/html/introduction-to-html/getting-started/index.html';
+const prUrl = 'https://github.com/mdn/learning-area/pull/846/files';
+const prHtmlPath =
+  'javascript/introduction-to-js-1/troubleshooting/number-game-errors.html';
+
+test('current GitHub blob UI supports static preview', async () => {
+  const { context, page } = await launchWithExtension();
+  try {
+    await page.goto(blobUrl, { waitUntil: 'domcontentloaded' });
+    const preview = page.getByRole('tab', { name: 'Preview' });
+    await expect(preview).toBeVisible({ timeout: 15_000 });
+    await preview.click();
+
+    const container = page.locator('.gh-html-preview-container');
+    await expect(container.getByRole('status')).toHaveText(/Ready|Partial/, {
+      timeout: 15_000,
+    });
+    const frame = container
+      .locator('iframe[title="Static HTML preview"]')
+      .contentFrame();
+    await expect(frame.getByText('This is my page')).toBeVisible();
+  } finally {
+    await context.close();
+  }
+});
+
+test('current GitHub PR UI receives HTML preview link', async () => {
+  const { context, page } = await launchWithExtension();
+  try {
+    await page.goto(prUrl, { waitUntil: 'domcontentloaded' });
+    const preview = page.getByRole('link', {
+      name: `Open full preview for ${prHtmlPath}`,
+    });
+    await expect(preview).toBeVisible({ timeout: 20_000 });
+    const href = await preview.getAttribute('href');
+    expect(href).toMatch(/^chrome-extension:\/\/[^/]+\/preview\.html\?/);
+    const query = new URL(href ?? '').searchParams;
+    expect(query.get('path')).toBe(prHtmlPath);
+    expect(query.get('ref')).toMatch(/^[0-9a-f]{40}$/i);
+  } finally {
+    await context.close();
+  }
+});

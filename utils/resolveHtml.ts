@@ -1,0 +1,983 @@
+import { buildJsdelivrUrl, buildRawUrl } from './github';
+import type {
+  RepoRef,
+  ResolveDiagnostic,
+  ResolveLimits,
+  ResolveOptions,
+  ResolveResult,
+  ResourceStats,
+} from './types';
+
+const DEFAULT_LIMITS: ResolveLimits = {
+  maxResourceBytes: 5 * 1024 * 1024,
+  maxTotalBytes: 25 * 1024 * 1024,
+  maxDepth: 4,
+  concurrency: 6,
+};
+
+const MEDIA_TYPES: Record<string, string> = {
+  avif: 'image/avif',
+  bmp: 'image/bmp',
+  css: 'text/css',
+  gif: 'image/gif',
+  ico: 'image/x-icon',
+  jpeg: 'image/jpeg',
+  jpg: 'image/jpeg',
+  mp3: 'audio/mpeg',
+  mp4: 'video/mp4',
+  oga: 'audio/ogg',
+  ogg: 'audio/ogg',
+  ogv: 'video/ogg',
+  otf: 'font/otf',
+  png: 'image/png',
+  svg: 'image/svg+xml',
+  ttf: 'font/ttf',
+  wav: 'audio/wav',
+  webm: 'video/webm',
+  webp: 'image/webp',
+  woff: 'font/woff',
+  woff2: 'font/woff2',
+};
+
+const SAFE_DATA_IMAGE_TYPES = new Set([
+  'image/avif',
+  'image/bmp',
+  'image/gif',
+  'image/jpeg',
+  'image/png',
+  'image/svg+xml',
+  'image/webp',
+  'image/x-icon',
+]);
+
+interface RepositoryUrl {
+  kind: 'repo' | 'external' | 'data' | 'fragment' | 'invalid';
+  value: string;
+  path?: string;
+  search?: string;
+  hash?: string;
+}
+
+interface ResourceData {
+  bytes: Uint8Array;
+  mime: string;
+}
+
+type ResourcePurpose = 'image' | 'font' | 'media' | 'text';
+
+class ResourceLoader {
+  readonly diagnostics: ResolveDiagnostic[] = [];
+  readonly stats: ResourceStats = {
+    fetched: 0,
+    inlined: 0,
+    rewritten: 0,
+    skipped: 0,
+    failed: 0,
+    bytes: 0,
+    maxDepthReached: 0,
+  };
+
+  private readonly cache = new Map<string, Promise<ResourceData>>();
+  private readonly waiters: Array<() => void> = [];
+  private active = 0;
+
+  constructor(
+    readonly repoRef: RepoRef,
+    readonly limits: ResolveLimits,
+    readonly signal: AbortSignal | undefined,
+  ) {}
+
+  addDiagnostic(
+    code: string,
+    message: string,
+    url?: string,
+    level: 'warning' | 'error' = 'warning',
+  ): void {
+    this.diagnostics.push({ level, code, message, ...(url ? { url } : {}) });
+  }
+
+  async load(path: string, search = ''): Promise<ResourceData> {
+    const url = `${buildRawUrl({ ...this.repoRef, path })}${search}`;
+    const cached = this.cache.get(url);
+    if (cached) return cached;
+
+    const request = this.withSlot(async () => {
+      this.signal?.throwIfAborted();
+      const response = await fetch(url, {
+        signal: this.signal,
+        credentials: 'omit',
+        referrerPolicy: 'no-referrer',
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const declaredLength = Number(response.headers.get('content-length'));
+      if (
+        Number.isFinite(declaredLength) &&
+        declaredLength > this.limits.maxResourceBytes
+      ) {
+        await response.body?.cancel();
+        throw new Error(
+          `resource exceeds ${this.limits.maxResourceBytes} byte limit`,
+        );
+      }
+
+      const bytes = await readBoundedBody(
+        response,
+        this.limits.maxResourceBytes,
+        this.signal,
+      );
+      if (this.stats.bytes + bytes.byteLength > this.limits.maxTotalBytes) {
+        throw new Error(`total resources exceed ${this.limits.maxTotalBytes} byte limit`);
+      }
+
+      this.stats.fetched += 1;
+      this.stats.bytes += bytes.byteLength;
+      const headerMime = response.headers.get('content-type')?.split(';')[0].trim();
+      return {
+        bytes,
+        mime: headerMime || mimeTypeFromPath(path),
+      };
+    });
+
+    this.cache.set(url, request);
+    return request;
+  }
+
+  private async withSlot<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.active >= this.limits.concurrency) {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      this.waiters.push(resolve);
+      await promise;
+    }
+    this.signal?.throwIfAborted();
+    this.active += 1;
+    try {
+      return await operation();
+    } finally {
+      this.active -= 1;
+      this.waiters.shift()?.();
+    }
+  }
+}
+
+export async function resolveHtml(
+  html: string,
+  options: ResolveOptions,
+): Promise<ResolveResult> {
+  options.signal?.throwIfAborted();
+  const limits = validateLimits({ ...DEFAULT_LIMITS, ...options.limits });
+  const loader = new ResourceLoader(options.repoRef, limits, options.signal);
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const sourcePath = resolveBasePath(doc, options.repoRef, loader);
+
+  if (options.target === 'static') {
+    await resolveStaticDocument(doc, sourcePath, loader);
+  } else {
+    await resolveSandboxDocument(doc, sourcePath, loader);
+  }
+
+  options.signal?.throwIfAborted();
+  return {
+    html: `<!doctype html>\n${doc.documentElement.outerHTML}`,
+    diagnostics: loader.diagnostics,
+    resources: { ...loader.stats },
+  };
+}
+
+export function resolveRepositoryUrl(
+  input: string,
+  repoRef: RepoRef,
+  basePath = repoRef.path,
+): RepositoryUrl {
+  const value = input.trim();
+  if (!value) return { kind: 'invalid', value };
+  if (value.startsWith('#')) return { kind: 'fragment', value };
+  if (/^data:/i.test(value)) return { kind: 'data', value };
+
+  if (value.startsWith('//')) {
+    return { kind: 'external', value: `https:${value}` };
+  }
+
+  let absolute: URL | null = null;
+  try {
+    absolute = new URL(value);
+  } catch {
+    absolute = null;
+  }
+
+  if (absolute) {
+    const repoPath = repositoryPathFromAbsoluteUrl(absolute, repoRef);
+    if (repoPath !== null) {
+      return {
+        kind: 'repo',
+        value,
+        path: repoPath,
+        search: absolute.search,
+        hash: absolute.hash,
+      };
+    }
+    return { kind: 'external', value: absolute.href };
+  }
+
+  try {
+    const base = new URL(
+      `https://repository.invalid/${basePath.replace(/^\/+/, '')}`,
+    );
+    const resolved = new URL(value, base);
+    return {
+      kind: 'repo',
+      value,
+      path: decodeUrlPath(resolved.pathname.replace(/^\//, '')),
+      search: resolved.search,
+      hash: resolved.hash,
+    };
+  } catch {
+    return { kind: 'invalid', value };
+  }
+}
+
+async function resolveStaticDocument(
+  doc: Document,
+  sourcePath: string,
+  loader: ResourceLoader,
+): Promise<void> {
+  for (const element of Array.from(
+    doc.querySelectorAll('script, iframe, frame, object, embed, portal, fencedframe'),
+  )) {
+    element.remove();
+    loader.stats.skipped += 1;
+  }
+
+  for (const meta of Array.from(doc.querySelectorAll('meta[http-equiv]'))) {
+    const directive = meta.getAttribute('http-equiv')?.toLowerCase();
+    if (directive === 'refresh' || directive === 'content-security-policy') {
+      meta.remove();
+    }
+  }
+  installStaticCsp(doc);
+  doc.querySelectorAll('base').forEach((base) => base.remove());
+
+  const stylesheetLinks = Array.from(
+    doc.querySelectorAll<HTMLLinkElement>('link[rel~="stylesheet"][href]'),
+  );
+  await Promise.all(
+    stylesheetLinks.map(async (link) => {
+      const href = link.getAttribute('href');
+      if (!href) return;
+      const resolved = resolveRepositoryUrl(href, loader.repoRef, sourcePath);
+      if (resolved.kind !== 'repo' || !resolved.path) {
+        link.remove();
+        loader.stats.skipped += 1;
+        loader.addDiagnostic(
+          'external-stylesheet-removed',
+          'Static preview removed non-repository stylesheet.',
+          href,
+        );
+        return;
+      }
+      try {
+        const resource = await loader.load(resolved.path, resolved.search);
+        const css = new TextDecoder().decode(resource.bytes);
+        const inlined = await inlineStaticCss(css, resolved.path, 1, loader);
+        const style = doc.createElement('style');
+        style.textContent = inlined;
+        link.replaceWith(style);
+        loader.stats.inlined += 1;
+      } catch (error) {
+        link.remove();
+        recordResourceFailure(loader, href, error);
+      }
+    }),
+  );
+
+  for (const style of Array.from(doc.querySelectorAll('style'))) {
+    style.textContent = await inlineStaticCss(
+      style.textContent ?? '',
+      sourcePath,
+      0,
+      loader,
+    );
+  }
+
+  await Promise.all(
+    Array.from(doc.querySelectorAll<HTMLElement>('[style]')).map(async (element) => {
+      const css = element.getAttribute('style');
+      if (css !== null) {
+        element.setAttribute(
+          'style',
+          await rewriteCssUrls(css, sourcePath, loader, true),
+        );
+      }
+    }),
+  );
+
+  const attributeJobs: Array<Promise<void>> = [];
+  const queueAttribute = (
+    selector: string,
+    attribute: string,
+    purpose: ResourcePurpose,
+  ) => {
+    for (const element of Array.from(doc.querySelectorAll(selector))) {
+      attributeJobs.push(
+        inlineElementAttribute(element, attribute, purpose, sourcePath, loader),
+      );
+    }
+  };
+
+  queueAttribute('img[src], input[type="image"][src]', 'src', 'image');
+  queueAttribute('video[poster]', 'poster', 'image');
+  queueAttribute('video[src], audio[src], source[src]', 'src', 'media');
+  queueAttribute('track[src]', 'src', 'text');
+  queueAttribute('[background]', 'background', 'image');
+  queueAttribute('svg image[href], svg use[href], svg feImage[href]', 'href', 'image');
+  queueAttribute(
+    'svg image[xlink\\:href], svg use[xlink\\:href], svg feImage[xlink\\:href]',
+    'xlink:href',
+    'image',
+  );
+  await Promise.all(attributeJobs);
+
+  await Promise.all(
+    Array.from(doc.querySelectorAll('img[srcset], source[srcset]')).map(
+      async (element) => {
+        const srcset = element.getAttribute('srcset');
+        if (srcset === null) return;
+        const resolved = await transformSrcset(srcset, async (url) => {
+          return staticResourceValue(url, 'image', sourcePath, loader);
+        });
+        if (resolved) element.setAttribute('srcset', resolved);
+        else element.removeAttribute('srcset');
+      },
+    ),
+  );
+
+  for (const link of Array.from(doc.querySelectorAll('link'))) {
+    const rel = link.getAttribute('rel')?.toLowerCase() ?? '';
+    if (!rel.split(/\s+/).some((token) => token === 'stylesheet')) {
+      link.remove();
+      loader.stats.skipped += 1;
+    }
+  }
+
+  for (const element of Array.from(doc.querySelectorAll('*'))) {
+    for (const attribute of Array.from(element.attributes)) {
+      const name = attribute.name.toLowerCase();
+      if (name.startsWith('on') || name === 'ping' || name === 'srcdoc') {
+        element.removeAttribute(attribute.name);
+      }
+    }
+  }
+
+  for (const anchor of Array.from(doc.querySelectorAll('[href]'))) {
+    const href = anchor.getAttribute('href');
+    if (href && !href.startsWith('#') && !anchor.closest('svg')) {
+      anchor.removeAttribute('href');
+    }
+  }
+  for (const formAttribute of ['action', 'formaction']) {
+    doc.querySelectorAll(`[${formAttribute}]`).forEach((element) => {
+      element.removeAttribute(formAttribute);
+    });
+  }
+}
+
+async function resolveSandboxDocument(
+  doc: Document,
+  sourcePath: string,
+  loader: ResourceLoader,
+): Promise<void> {
+  const existingBase = doc.querySelector('base');
+  existingBase?.remove();
+  const base = doc.createElement('base');
+  const sourceDirectory = sourcePath.endsWith('/')
+    ? sourcePath
+    : sourcePath.slice(0, sourcePath.lastIndexOf('/') + 1);
+  base.href = buildJsdelivrUrl(loader.repoRef, sourceDirectory);
+  const importMap = doc.createElement('script');
+  importMap.type = 'importmap';
+  importMap.textContent = JSON.stringify({
+    imports: {
+      'https://cdn.jsdelivr.net/': buildJsdelivrUrl(loader.repoRef, ''),
+    },
+  });
+  doc.head.prepend(base, importMap);
+
+  const urlAttributes = [
+    'href',
+    'src',
+    'poster',
+    'data',
+    'action',
+    'formaction',
+    'background',
+    'cite',
+    'longdesc',
+    'manifest',
+    'xlink:href',
+  ];
+  for (const attribute of urlAttributes) {
+    for (const element of Array.from(doc.querySelectorAll(`[${cssAttribute(attribute)}]`))) {
+      const value = element.getAttribute(attribute);
+      if (!value) continue;
+      const resolved = resolveRepositoryUrl(value, loader.repoRef, sourcePath);
+      if (resolved.kind === 'repo' && resolved.path !== undefined) {
+        element.setAttribute(attribute, repositoryCdnUrl(resolved, loader.repoRef));
+        loader.stats.rewritten += 1;
+      } else if (resolved.kind === 'external') {
+        element.setAttribute(attribute, resolved.value);
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from(doc.querySelectorAll('img[srcset], source[srcset]')).map(
+      async (element) => {
+        const srcset = element.getAttribute('srcset');
+        if (srcset === null) return;
+        element.setAttribute(
+          'srcset',
+          await transformSrcset(srcset, async (url) => {
+            const resolved = resolveRepositoryUrl(url, loader.repoRef, sourcePath);
+            if (resolved.kind === 'repo' && resolved.path !== undefined) {
+              loader.stats.rewritten += 1;
+              return repositoryCdnUrl(resolved, loader.repoRef);
+            }
+            return resolved.kind === 'invalid' ? null : resolved.value;
+          }),
+        );
+      },
+    ),
+  );
+
+  for (const style of Array.from(doc.querySelectorAll('style'))) {
+    style.textContent = await rewriteSandboxCss(
+      style.textContent ?? '',
+      sourcePath,
+      loader,
+    );
+  }
+  await Promise.all(
+    Array.from(doc.querySelectorAll<HTMLElement>('[style]')).map(async (element) => {
+      const css = element.getAttribute('style');
+      if (css !== null) {
+        element.setAttribute(
+          'style',
+          await rewriteCssUrls(css, sourcePath, loader, false),
+        );
+      }
+    }),
+  );
+}
+
+async function rewriteSandboxCss(
+  css: string,
+  sourcePath: string,
+  loader: ResourceLoader,
+): Promise<string> {
+  const importPattern =
+    /@import\s+(?:url\(\s*(["']?)(.*?)\1\s*\)|(["'])(.*?)\3)\s*([^;]*);/gi;
+  const importsRewritten = await replaceAsync(
+    css,
+    importPattern,
+    async (match) => {
+      const url = match[2] || match[4];
+      const media = match[5]?.trim();
+      const resolved = resolveRepositoryUrl(url, loader.repoRef, sourcePath);
+      if (resolved.kind === 'repo' && resolved.path !== undefined) {
+        loader.stats.rewritten += 1;
+        const suffix = media ? ` ${media}` : '';
+        return `@import url("${repositoryCdnUrl(resolved, loader.repoRef)}")${suffix};`;
+      }
+      if (resolved.kind === 'external') {
+        const suffix = media ? ` ${media}` : '';
+        return `@import url("${resolved.value.replaceAll('"', '%22')}")${suffix};`;
+      }
+      loader.stats.skipped += 1;
+      loader.addDiagnostic(
+        'sandbox-css-import-removed',
+        'Executable preview removed invalid CSS import.',
+        url,
+      );
+      return '';
+    },
+  );
+  return rewriteCssUrls(importsRewritten, sourcePath, loader, false);
+}
+
+async function inlineStaticCss(
+  css: string,
+  sourcePath: string,
+  depth: number,
+  loader: ResourceLoader,
+): Promise<string> {
+  loader.stats.maxDepthReached = Math.max(loader.stats.maxDepthReached, depth);
+  const importPattern = /@import\s+(?:url\(\s*(["']?)(.*?)\1\s*\)|(["'])(.*?)\3)\s*([^;]*);/gi;
+  const withoutImports = await replaceAsync(css, importPattern, async (match) => {
+    const url = match[2] || match[4];
+    const media = match[5]?.trim();
+    const resolved = resolveRepositoryUrl(url, loader.repoRef, sourcePath);
+    if (resolved.kind !== 'repo' || !resolved.path) {
+      loader.stats.skipped += 1;
+      loader.addDiagnostic(
+        'css-import-removed',
+        'Static preview removed non-repository CSS import.',
+        url,
+      );
+      return '';
+    }
+    if (depth >= loader.limits.maxDepth) {
+      loader.stats.skipped += 1;
+      loader.addDiagnostic(
+        'css-depth-limit',
+        `CSS import exceeded depth limit ${loader.limits.maxDepth}.`,
+        url,
+      );
+      return '';
+    }
+    try {
+      const resource = await loader.load(resolved.path, resolved.search);
+      const nested = await inlineStaticCss(
+        new TextDecoder().decode(resource.bytes),
+        resolved.path,
+        depth + 1,
+        loader,
+      );
+      loader.stats.inlined += 1;
+      return media ? `@media ${media} {\n${nested}\n}` : nested;
+    } catch (error) {
+      recordResourceFailure(loader, url, error);
+      return '';
+    }
+  });
+  return rewriteCssUrls(withoutImports, sourcePath, loader, true);
+}
+
+async function rewriteCssUrls(
+  css: string,
+  sourcePath: string,
+  loader: ResourceLoader,
+  inline: boolean,
+): Promise<string> {
+  const urlPattern = /url\(\s*(["']?)(.*?)\1\s*\)/gi;
+  return replaceAsync(css, urlPattern, async (match) => {
+    const url = match[2].trim();
+    if (!url || url.startsWith('#')) return match[0];
+    if (inline) {
+      const purpose = inferCssPurpose(url);
+      const value = await staticResourceValue(url, purpose, sourcePath, loader);
+      return value ? `url("${value.replaceAll('"', '%22')}")` : 'url("")';
+    }
+
+    const resolved = resolveRepositoryUrl(url, loader.repoRef, sourcePath);
+    if (resolved.kind === 'repo' && resolved.path !== undefined) {
+      loader.stats.rewritten += 1;
+      return `url("${repositoryCdnUrl(resolved, loader.repoRef)}")`;
+    }
+    if (resolved.kind === 'external') {
+      return `url("${resolved.value.replaceAll('"', '%22')}")`;
+    }
+    return match[0];
+  });
+}
+
+async function inlineElementAttribute(
+  element: Element,
+  attribute: string,
+  purpose: ResourcePurpose,
+  sourcePath: string,
+  loader: ResourceLoader,
+): Promise<void> {
+  const value = element.getAttribute(attribute);
+  if (!value) return;
+  const inlined = await staticResourceValue(
+    value,
+    purpose,
+    sourcePath,
+    loader,
+  );
+  if (inlined) element.setAttribute(attribute, inlined);
+  else element.removeAttribute(attribute);
+}
+
+async function staticResourceValue(
+  value: string,
+  purpose: ResourcePurpose,
+  sourcePath: string,
+  loader: ResourceLoader,
+): Promise<string | null> {
+  const resolved = resolveRepositoryUrl(value, loader.repoRef, sourcePath);
+  if (resolved.kind === 'fragment') return resolved.value;
+  if (resolved.kind === 'data') {
+    const safe = sanitizeExistingDataUrl(resolved.value, purpose, loader);
+    if (!safe) {
+      loader.stats.skipped += 1;
+      loader.addDiagnostic(
+        'unsafe-data-url-removed',
+        'Static preview removed unsupported data URL.',
+      );
+    }
+    return safe;
+  }
+  if (resolved.kind !== 'repo' || !resolved.path) {
+    loader.stats.skipped += 1;
+    loader.addDiagnostic(
+      'external-resource-removed',
+      'Static preview removed non-repository resource.',
+      value,
+    );
+    return null;
+  }
+
+  try {
+    const resource = await loader.load(resolved.path, resolved.search);
+    let bytes = resource.bytes;
+    let mime = normalizedMime(resource.mime, resolved.path);
+    if (mime === 'image/svg+xml') {
+      const sanitized = sanitizeSvg(new TextDecoder().decode(bytes), loader);
+      bytes = new TextEncoder().encode(sanitized);
+    }
+    if (!isAllowedDataMime(mime, purpose)) {
+      loader.stats.skipped += 1;
+      loader.addDiagnostic(
+        'unsupported-resource-type',
+        `Static preview cannot inline ${mime}.`,
+        value,
+      );
+      return null;
+    }
+    loader.stats.inlined += 1;
+    return `data:${mime};base64,${bytesToBase64(bytes)}`;
+  } catch (error) {
+    recordResourceFailure(loader, value, error);
+    return null;
+  }
+}
+
+export async function transformSrcset(
+  srcset: string,
+  transform: (url: string) => Promise<string | null>,
+): Promise<string> {
+  const candidates = parseSrcset(srcset);
+  const transformed = await Promise.all(
+    candidates.map(async ({ url, descriptor }) => {
+      const next = await transform(url);
+      return next ? `${next}${descriptor ? ` ${descriptor}` : ''}` : null;
+    }),
+  );
+  return transformed.filter((value): value is string => value !== null).join(', ');
+}
+
+function parseSrcset(srcset: string): Array<{ url: string; descriptor: string }> {
+  const candidates: Array<{ url: string; descriptor: string }> = [];
+  let position = 0;
+  while (position < srcset.length) {
+    while (position < srcset.length && /[\s,]/.test(srcset[position])) position += 1;
+    if (position >= srcset.length) break;
+
+    const urlStart = position;
+    while (position < srcset.length && !/\s/.test(srcset[position])) position += 1;
+    let url = srcset.slice(urlStart, position);
+    let trailingCommas = 0;
+    while (url.endsWith(',')) {
+      url = url.slice(0, -1);
+      trailingCommas += 1;
+    }
+    if (!url) continue;
+    if (trailingCommas > 0) {
+      candidates.push({ url, descriptor: '' });
+      continue;
+    }
+
+    while (position < srcset.length && /\s/.test(srcset[position])) position += 1;
+    const descriptorStart = position;
+    let parentheses = 0;
+    while (position < srcset.length) {
+      const char = srcset[position];
+      if (char === '(') parentheses += 1;
+      else if (char === ')') parentheses = Math.max(0, parentheses - 1);
+      else if (char === ',' && parentheses === 0) break;
+      position += 1;
+    }
+    const descriptor = srcset.slice(descriptorStart, position).trim();
+    if (position < srcset.length && srcset[position] === ',') position += 1;
+    candidates.push({ url, descriptor });
+  }
+  return candidates;
+}
+
+function resolveBasePath(
+  doc: Document,
+  repoRef: RepoRef,
+  loader: ResourceLoader,
+): string {
+  const href = doc.querySelector('base[href]')?.getAttribute('href');
+  if (!href) return repoRef.path;
+  const resolved = resolveRepositoryUrl(href, repoRef, repoRef.path);
+  if (resolved.kind === 'repo' && resolved.path !== undefined) {
+    return href.endsWith('/') && !resolved.path.endsWith('/')
+      ? `${resolved.path}/`
+      : resolved.path;
+  }
+  loader.addDiagnostic(
+    'external-base-ignored',
+    'External base URL cannot define repository resource paths.',
+    href,
+  );
+  return repoRef.path;
+}
+
+function repositoryPathFromAbsoluteUrl(url: URL, repoRef: RepoRef): string | null {
+  const owner = encodeURIComponent(repoRef.owner);
+  const repo = encodeURIComponent(repoRef.repo);
+  const ref = encodeURIComponent(repoRef.ref);
+  const rawPrefix = `/${owner}/${repo}/${ref}/`;
+  if (
+    url.hostname === 'raw.githubusercontent.com' &&
+    url.pathname.startsWith(rawPrefix)
+  ) {
+    return decodeUrlPath(url.pathname.slice(rawPrefix.length));
+  }
+
+  const cdnPrefix = `/gh/${owner}/${repo}@${ref}/`;
+  if (url.hostname === 'cdn.jsdelivr.net' && url.pathname.startsWith(cdnPrefix)) {
+    return decodeUrlPath(url.pathname.slice(cdnPrefix.length));
+  }
+
+  const githubPrefix = `/${owner}/${repo}/`;
+  if (url.hostname === 'github.com' && url.pathname.startsWith(githubPrefix)) {
+    const remainder = url.pathname.slice(githubPrefix.length);
+    for (const marker of ['blob/', 'raw/']) {
+      const prefix = `${marker}${ref}/`;
+      if (remainder.startsWith(prefix)) {
+        return decodeUrlPath(remainder.slice(prefix.length));
+      }
+    }
+  }
+  return null;
+}
+
+function repositoryCdnUrl(resolved: RepositoryUrl, repoRef: RepoRef): string {
+  return `${buildJsdelivrUrl(repoRef, resolved.path ?? '')}${resolved.search ?? ''}${resolved.hash ?? ''}`;
+}
+
+function installStaticCsp(doc: Document): void {
+  doc.querySelectorAll('meta[http-equiv="Content-Security-Policy" i]').forEach(
+    (meta) => meta.remove(),
+  );
+  const meta = doc.createElement('meta');
+  meta.httpEquiv = 'Content-Security-Policy';
+  meta.content = [
+    "default-src 'none'",
+    "base-uri 'none'",
+    "connect-src 'none'",
+    "font-src data:",
+    "form-action 'none'",
+    "frame-src 'none'",
+    "img-src data:",
+    "media-src data:",
+    "object-src 'none'",
+    "script-src 'none'",
+    "style-src 'unsafe-inline'",
+    "worker-src 'none'",
+  ].join('; ');
+  doc.head.prepend(meta);
+}
+
+function sanitizeExistingDataUrl(
+  value: string,
+  purpose: ResourcePurpose,
+  loader: ResourceLoader,
+): string | null {
+  const match = /^data:([^;,]+)?((?:;[^,]*)?),(.*)$/is.exec(value);
+  if (!match) return null;
+  const mime = (match[1] || 'text/plain').toLowerCase();
+  if (!isAllowedDataMime(mime, purpose)) return null;
+  if (mime !== 'image/svg+xml') return value;
+
+  try {
+    const parameters = match[2].toLowerCase();
+    const decoded = parameters.includes(';base64')
+      ? atob(match[3].replace(/\s/g, ''))
+      : decodeURIComponent(match[3]);
+    const sanitized = sanitizeSvg(decoded, loader);
+    return `data:image/svg+xml;base64,${bytesToBase64(new TextEncoder().encode(sanitized))}`;
+  } catch {
+    return null;
+  }
+}
+
+function sanitizeSvg(svg: string, loader: ResourceLoader): string {
+  const doc = new DOMParser().parseFromString(svg, 'image/svg+xml');
+  doc.querySelectorAll('script, foreignObject, iframe, object, embed').forEach(
+    (element) => element.remove(),
+  );
+  for (const element of Array.from(doc.querySelectorAll('*'))) {
+    for (const attribute of Array.from(element.attributes)) {
+      const name = attribute.name.toLowerCase();
+      const value = attribute.value.trim();
+      if (
+        name.startsWith('on') ||
+        name === 'style' ||
+        ((name === 'href' || name === 'xlink:href') && !value.startsWith('#'))
+      ) {
+        element.removeAttribute(attribute.name);
+      }
+    }
+  }
+  loader.addDiagnostic(
+    'svg-sanitized',
+    'Static preview removed active or network-capable SVG content.',
+  );
+  return new XMLSerializer().serializeToString(doc.documentElement);
+}
+
+function isAllowedDataMime(mime: string, purpose: ResourcePurpose): boolean {
+  if (purpose === 'image') return SAFE_DATA_IMAGE_TYPES.has(mime);
+  if (purpose === 'font') return mime.startsWith('font/');
+  if (purpose === 'media') return mime.startsWith('audio/') || mime.startsWith('video/');
+  return mime === 'text/vtt' || mime === 'text/plain';
+}
+
+function inferCssPurpose(url: string): ResourcePurpose {
+  const dataMime = /^data:([^;,]+)/i.exec(url)?.[1]?.toLowerCase();
+  if (dataMime?.startsWith('font/')) return 'font';
+  if (dataMime?.startsWith('audio/') || dataMime?.startsWith('video/')) {
+    return 'media';
+  }
+  const mime = mimeTypeFromPath(url);
+  if (mime.startsWith('font/')) return 'font';
+  if (mime.startsWith('audio/') || mime.startsWith('video/')) return 'media';
+  return 'image';
+}
+
+function normalizedMime(mime: string, path: string): string {
+  const lower = mime.toLowerCase();
+  const inferred = mimeTypeFromPath(path);
+  if (
+    (lower === 'application/octet-stream' || lower === 'text/plain') &&
+    inferred !== 'application/octet-stream'
+  ) {
+    return inferred;
+  }
+  return lower;
+}
+
+function mimeTypeFromPath(path: string): string {
+  const pathname = path.split(/[?#]/, 1)[0];
+  const extension = pathname.split('.').pop()?.toLowerCase() ?? '';
+  return MEDIA_TYPES[extension] ?? 'application/octet-stream';
+}
+
+async function readBoundedBody(
+  response: Response,
+  limit: number,
+  signal: AbortSignal | undefined,
+): Promise<Uint8Array> {
+  if (!response.body) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength > limit) throw new Error(`resource exceeds ${limit} byte limit`);
+    return bytes;
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    while (true) {
+      signal?.throwIfAborted();
+      const { done, value } = await reader.read();
+      if (done) break;
+      length += value.byteLength;
+      if (length > limit) {
+        await reader.cancel();
+        throw new Error(`resource exceeds ${limit} byte limit`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function replaceAsync(
+  input: string,
+  pattern: RegExp,
+  replacer: (match: RegExpExecArray) => Promise<string>,
+): Promise<string> {
+  const matches = Array.from(input.matchAll(pattern));
+  if (matches.length === 0) return input;
+  const replacements = await Promise.all(matches.map(replacer));
+  let output = '';
+  let cursor = 0;
+  matches.forEach((match, index) => {
+    const start = match.index ?? cursor;
+    output += input.slice(cursor, start) + replacements[index];
+    cursor = start + match[0].length;
+  });
+  return output + input.slice(cursor);
+}
+
+function recordResourceFailure(
+  loader: ResourceLoader,
+  url: string,
+  error: unknown,
+): void {
+  if (error instanceof DOMException && error.name === 'AbortError') throw error;
+  loader.stats.failed += 1;
+  loader.addDiagnostic(
+    'resource-fetch-failed',
+    error instanceof Error ? error.message : 'Resource fetch failed.',
+    url,
+    'error',
+  );
+}
+
+function decodeUrlPath(path: string): string {
+  return path
+    .split('/')
+    .map((segment) => {
+      try {
+        return decodeURIComponent(segment);
+      } catch {
+        return segment;
+      }
+    })
+    .join('/');
+}
+
+function cssAttribute(attribute: string): string {
+  return attribute.replace(':', '\\:');
+}
+
+function validateLimits(limits: ResolveLimits): ResolveLimits {
+  if (
+    limits.maxResourceBytes <= 0 ||
+    limits.maxTotalBytes <= 0 ||
+    limits.maxDepth < 0 ||
+    limits.concurrency < 1
+  ) {
+    throw new Error('Resolve limits must be positive; maxDepth may be zero.');
+  }
+  return limits;
+}
+
+

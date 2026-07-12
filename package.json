@@ -1,0 +1,34 @@
+{
+  "name": "github-html-preview",
+  "description": "Safely preview public HTML files and pull-request changes on GitHub",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build",
+    "zip": "wxt zip",
+    "compile": "tsc --noEmit",
+    "postinstall": "wxt prepare",
+    "pretest": "wxt build",
+    "test": "vitest run",
+    "pretest:e2e": "wxt build",
+    "test:e2e": "playwright test",
+    "pretest:smoke": "wxt build",
+    "test:smoke": "playwright test --config=playwright.smoke.config.ts"
+  },
+  "dependencies": {
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@wxt-dev/module-react": "^1.1.5",
+    "jsdom": "^29.1.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10",
+    "wxt": "^0.20.27"
+  }
+}

@@ -6,7 +6,11 @@ import {
 } from '@/utils/github';
 import { enabledStorage, githubTokenStorage } from '@/utils/storage';
 import { resolveHtml } from '@/utils/resolveHtml';
-import { renderStaticPreview, type RenderResult } from '@/utils/renderer';
+import {
+  renderStaticPreview,
+  type RenderResult,
+  type ScrollPosition,
+} from '@/utils/renderer';
 import type { RepoRef } from '@/utils/types';
 import { debugError, debugLog } from '@/utils/debug';
 
@@ -16,18 +20,23 @@ const RICH_CONTAINER_CLASS = 'gh-html-preview-pr-rich';
 const DIFF_SELECTOR =
   '#files .file, [data-testid="diff-file"], [data-testid="diff-file-header"], [data-diff-header-wrapper], [role="region"][id^="diff-"]';
 
-interface PullHead {
+interface PullSide {
   owner: string;
   repo: string;
   sha: string;
   privateRepo: boolean;
 }
 
+interface PullComparison {
+  base: PullSide;
+  head: PullSide;
+}
+
 interface PrRouteState {
   readonly key: string;
   readonly route: PrFilesRoute;
   readonly controller: AbortController;
-  metadata: Promise<PullHead> | null;
+  metadata: Promise<PullComparison> | null;
   readonly richDiffs: Set<RichDiffState>;
 }
 
@@ -42,14 +51,29 @@ interface DiffTarget {
 
 interface RichDiffState {
   readonly target: DiffTarget;
+  readonly initialHead: PullSide | null;
   readonly sourceButton: HTMLButtonElement;
-  readonly richButton: HTMLButtonElement;
+  readonly splitButton: HTMLButtonElement;
+  readonly afterButton: HTMLButtonElement;
+  readonly previewLink: HTMLAnchorElement;
   readonly container: HTMLElement;
   readonly status: HTMLElement;
-  readonly previewArea: HTMLElement;
+  readonly comparisonArea: HTMLElement;
+  readonly basePane: HTMLElement;
+  readonly headPane: HTMLElement;
+  readonly baseLabel: HTMLElement;
+  readonly headLabel: HTMLElement;
+  readonly baseArea: HTMLElement;
+  readonly headArea: HTMLElement;
+  readonly syncInput: HTMLInputElement;
+  readonly viewportSelect: HTMLSelectElement;
+  readonly resizeObserver: ResizeObserver;
   controller: AbortController | null;
-  render: RenderResult | null;
+  baseRender: RenderResult | null;
+  headRender: RenderResult | null;
+  comparison: PullComparison | null;
   resolving: Promise<void> | null;
+  mode: 'source' | 'split' | 'after';
 }
 
 export default defineContentScript({
@@ -67,7 +91,9 @@ export default defineContentScript({
     const clearControls = () => {
       for (const rich of state?.richDiffs ?? []) {
         rich.controller?.abort();
-        rich.render?.destroy();
+        rich.baseRender?.destroy();
+        rich.headRender?.destroy();
+        rich.resizeObserver.disconnect();
         rich.target.fileContent.style.removeProperty('display');
         rich.container.remove();
       }
@@ -88,7 +114,7 @@ export default defineContentScript({
       }
     };
 
-    const renderCards = async (routeState: PrRouteState) => {
+    const renderCards = (routeState: PrRouteState) => {
       const targets = findDiffTargets();
       debugLog('pr', 'target-scan', {
         classicCards: document.querySelectorAll('#files .file').length,
@@ -103,72 +129,33 @@ export default defineContentScript({
         targets: targets.length,
       });
       if (targets.length === 0) return;
-      const unresolved: DiffTarget[] = [];
       for (const target of targets) {
         if (target.header.querySelector(`.${PREVIEW_CONTROLS_CLASS}`)) continue;
-        if (target.repoRef) {
-          insertPreviewControls(
-            target,
-            {
-              owner: target.repoRef.owner,
-              repo: target.repoRef.repo,
-              sha: target.repoRef.ref,
-              privateRepo: false,
-            },
-            githubToken,
-            routeState,
-          );
-        } else {
-          unresolved.push(target);
-        }
-      }
-      if (unresolved.length === 0) {
-        debugLog('pr', 'buttons-rendered', {
-          targets: targets.length,
-          source: 'view-file-links',
-        });
-        return;
-      }
-      try {
-        routeState.metadata ??= fetchPullHead(
-          routeState.route,
-          routeState.controller.signal,
+        insertPreviewControls(
+          target,
+          target.repoRef
+            ? {
+                owner: target.repoRef.owner,
+                repo: target.repoRef.repo,
+                sha: target.repoRef.ref,
+                privateRepo: false,
+              }
+            : null,
           githubToken,
+          routeState,
         );
-        const head = await routeState.metadata;
-        routeState.controller.signal.throwIfAborted();
-        if (state !== routeState) return;
-        for (const target of unresolved) {
-          if (target.header.querySelector(`.${PREVIEW_CONTROLS_CLASS}`)) continue;
-          insertPreviewControls(target, head, githubToken, routeState);
-        }
-        debugLog('pr', 'buttons-rendered', {
-          owner: head.owner,
-          repo: head.repo,
-          privateRepo: head.privateRepo,
-          targets: unresolved.length,
-          source: 'pull-api',
-        });
-      } catch (error) {
-        if (
-          !(error instanceof DOMException && error.name === 'AbortError') &&
-          !routeState.controller.signal.aborted
-        ) {
-          debugError('pr', 'metadata-failed', error, {
-            owner: routeState.route.owner,
-            repo: routeState.route.repo,
-            pull: routeState.route.pullNumber,
-          });
-          console.error('[gh-html-preview] PR metadata request failed:', error);
-        }
       }
+      debugLog('pr', 'buttons-rendered', {
+        targets: targets.length,
+        source: 'dom',
+      });
     };
 
     const scheduleRender = () => {
       if (!state || renderTimer !== null) return;
       renderTimer = window.setTimeout(() => {
         renderTimer = null;
-        if (state) void renderCards(state);
+        if (state) renderCards(state);
       }, 80);
     };
 
@@ -239,11 +226,11 @@ export default defineContentScript({
   },
 });
 
-async function fetchPullHead(
+async function fetchPullComparison(
   route: PrFilesRoute,
   signal: AbortSignal,
   githubToken: string | null,
-): Promise<PullHead> {
+): Promise<PullComparison> {
   const url = `https://api.github.com/repos/${encodeURIComponent(route.owner)}/${encodeURIComponent(route.repo)}/pulls/${route.pullNumber}`;
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
@@ -269,13 +256,23 @@ async function fetchPullHead(
   if (typeof data !== 'object' || data === null || Array.isArray(data)) {
     throw new Error('GitHub API returned invalid PR metadata.');
   }
-  const head = (data as Record<string, unknown>).head;
-  if (typeof head !== 'object' || head === null || Array.isArray(head)) {
-    throw new Error('PR head metadata is missing.');
+  return {
+    base: parsePullSide((data as Record<string, unknown>).base, 'base'),
+    head: parsePullSide((data as Record<string, unknown>).head, 'head'),
+  };
+}
+
+function parsePullSide(value: unknown, label: 'base' | 'head'): PullSide {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    Array.isArray(value)
+  ) {
+    throw new Error(`PR ${label} metadata is missing.`);
   }
-  const headRecord = head as Record<string, unknown>;
-  const sha = headRecord.sha;
-  const repoValue = headRecord.repo;
+  const record = value as Record<string, unknown>;
+  const sha = record.sha;
+  const repoValue = record.repo;
   if (
     typeof sha !== 'string' ||
     !/^[0-9a-f]{40}$/i.test(sha) ||
@@ -283,14 +280,14 @@ async function fetchPullHead(
     repoValue === null ||
     Array.isArray(repoValue)
   ) {
-    throw new Error('PR head repository or SHA is invalid.');
+    throw new Error(`PR ${label} repository or SHA is invalid.`);
   }
   const fullName = (repoValue as Record<string, unknown>).full_name;
   if (typeof fullName !== 'string') {
-    throw new Error('PR head repository name is missing.');
+    throw new Error(`PR ${label} repository name is missing.`);
   }
   const match = /^([^/]+)\/([^/]+)$/.exec(fullName);
-  if (!match) throw new Error('PR head repository name is malformed.');
+  if (!match) throw new Error(`PR ${label} repository name is malformed.`);
   return {
     owner: match[1],
     repo: match[2],
@@ -440,45 +437,42 @@ function validHtmlPath(path: string | null | undefined): path is string {
 
 function insertPreviewControls(
   target: DiffTarget,
-  head: PullHead,
+  initialHead: PullSide | null,
   githubToken: string | null,
   routeState: PrRouteState,
 ): void {
   debugLog('pr', 'controls-insert', {
     path: target.path,
-    privateRepo: head.privateRepo,
+    privateRepo: initialHead?.privateRepo ?? false,
   });
   const controls = document.createElement('div');
   controls.className = `${PREVIEW_CONTROLS_CLASS} BtnGroup d-inline-flex`;
   controls.style.cssText = 'display:inline-flex;flex-shrink:0;';
 
-  const sourceButton = createDiffButton(
-    'Display the source diff',
-    'source selected',
-    codeIcon(),
-  );
+  const sourceButton = createTextDiffButton('Source', 'Display the source diff');
+  sourceButton.classList.add('selected');
   sourceButton.setAttribute('aria-current', 'true');
-  const richButton = createDiffButton(
-    'Display the rich diff',
-    'rendered',
-    fileIcon(),
+  const splitButton = createTextDiffButton(
+    'Split',
+    'Display synchronized before and after previews',
   );
-  controls.append(sourceButton, richButton);
+  const afterButton = createTextDiffButton(
+    'After',
+    'Display the rendered PR head',
+  );
+  controls.append(sourceButton, splitButton, afterButton);
 
   const link = document.createElement('a');
   link.className = `${PREVIEW_LINK_CLASS} btn btn-sm ml-2`;
   link.textContent = 'Preview HTML';
   link.setAttribute('aria-label', `Open full preview for ${target.path}`);
   link.title = 'Open full HTML preview';
-  link.href = buildPreviewPageUrl(
-    {
-      owner: head.owner,
-      repo: head.repo,
-      ref: head.sha,
-      path: target.path,
-    },
-    head.privateRepo,
-  );
+  link.href = initialHead
+    ? buildPreviewPageUrl(
+        sideRepoRef(initialHead, target.path),
+        initialHead.privateRepo,
+      )
+    : '#';
   link.target = '_blank';
   link.rel = 'noreferrer';
   link.style.cssText =
@@ -489,131 +483,289 @@ function insertPreviewControls(
   container.setAttribute('aria-label', `Rich HTML diff for ${target.path}`);
   container.style.cssText =
     'display:none;flex-direction:column;height:calc(100dvh - 160px);min-height:500px;border-top:1px solid var(--borderColor-default,#d1d9e0);background:var(--bgColor-default,#fff);';
+  const header = document.createElement('div');
+  header.style.cssText =
+    'display:flex;align-items:center;justify-content:space-between;gap:12px;padding:6px 10px;border-bottom:1px solid var(--borderColor-default,#d1d9e0);background:var(--bgColor-muted,#f6f8fa);';
   const status = document.createElement('div');
   status.setAttribute('role', 'status');
   status.style.cssText =
-    'padding:8px 12px;border-bottom:1px solid var(--borderColor-default,#d1d9e0);color:var(--fgColor-muted,#59636e);font-size:12px;font-weight:600;';
-  status.textContent = 'Ready to render HTML';
-  const previewArea = document.createElement('div');
-  previewArea.style.cssText = 'flex:1;min-height:0;overflow:hidden;';
-  container.append(status, previewArea);
+    'color:var(--fgColor-muted,#59636e);font-size:12px;font-weight:600;';
+  status.textContent = 'Choose Split or After';
+  const toolbar = document.createElement('div');
+  toolbar.style.cssText = 'display:flex;align-items:center;gap:8px;flex-wrap:wrap;';
+  const viewportSelect = document.createElement('select');
+  viewportSelect.setAttribute('aria-label', 'Preview viewport width');
+  viewportSelect.className = 'form-select select-sm';
+  for (const [value, text] of [
+    ['responsive', 'Responsive'],
+    ['1280', 'Desktop'],
+    ['768', 'Tablet'],
+    ['390', 'Mobile'],
+  ]) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = text;
+    viewportSelect.appendChild(option);
+  }
+  const syncLabel = document.createElement('label');
+  syncLabel.style.cssText =
+    'display:inline-flex;align-items:center;gap:4px;font-size:12px;white-space:nowrap;';
+  const syncInput = document.createElement('input');
+  syncInput.type = 'checkbox';
+  syncInput.checked = true;
+  syncInput.setAttribute('aria-label', 'Synchronize preview scrolling');
+  syncLabel.append(syncInput, document.createTextNode('Sync scroll'));
+  const reloadButton = createToolbarButton('Reload');
+  const fullscreenButton = createToolbarButton('Full screen');
+  toolbar.append(viewportSelect, syncLabel, reloadButton, fullscreenButton);
+  header.append(status, toolbar);
+
+  const comparisonArea = document.createElement('div');
+  comparisonArea.style.cssText =
+    'display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);flex:1;min-height:0;overflow:hidden;background:var(--bgColor-muted,#f6f8fa);';
+  const base = createComparisonPane('Before');
+  const head = createComparisonPane('After');
+  comparisonArea.append(base.pane, head.pane);
+  container.append(header, comparisonArea);
   target.fileContent.before(container);
   target.actions.prepend(controls, link);
 
+  const resizeObserver = new ResizeObserver(([entry]) => {
+    if (!entry) return;
+    comparisonArea.style.gridTemplateColumns =
+      entry.contentRect.width < 900 || base.pane.style.display === 'none'
+        ? 'minmax(0,1fr)'
+        : 'minmax(0,1fr) minmax(0,1fr)';
+  });
+  resizeObserver.observe(container);
+
   const richState: RichDiffState = {
     target,
+    initialHead,
     sourceButton,
-    richButton,
+    splitButton,
+    afterButton,
+    previewLink: link,
     container,
     status,
-    previewArea,
+    comparisonArea,
+    basePane: base.pane,
+    headPane: head.pane,
+    baseLabel: base.label,
+    headLabel: head.label,
+    baseArea: base.area,
+    headArea: head.area,
+    syncInput,
+    viewportSelect,
+    resizeObserver,
     controller: null,
-    render: null,
+    baseRender: null,
+    headRender: null,
+    comparison: null,
     resolving: null,
+    mode: 'source',
   };
   routeState.richDiffs.add(richState);
 
-  sourceButton.addEventListener('click', () => showSourceDiff(richState));
-  richButton.addEventListener('click', () => {
-    showRichDiff(richState);
-    if (!richState.render && !richState.resolving) {
-      richState.resolving = renderRichDiff(
-        richState,
-        head,
-        githubToken,
-        routeState,
-      ).finally(() => {
-        richState.resolving = null;
+  if (!initialHead) {
+    void getPullComparison(routeState, githubToken)
+      .then((comparison) => {
+        if (!richState.container.isConnected) return;
+        richState.comparison = comparison;
+        richState.previewLink.href = buildPreviewPageUrl(
+          sideRepoRef(comparison.head, target.path),
+          comparison.head.privateRepo,
+        );
+      })
+      .catch((error: unknown) => {
+        debugError('pr', 'metadata-background-failed', error, {
+          path: target.path,
+        });
       });
+  }
+
+  sourceButton.addEventListener('click', () => showSourceDiff(richState));
+  splitButton.addEventListener('click', () => {
+    showRenderedDiff(richState, 'split');
+    startRender(richState, githubToken, routeState, false);
+  });
+  afterButton.addEventListener('click', () => {
+    showRenderedDiff(richState, 'after');
+    startRender(richState, githubToken, routeState, false);
+  });
+  reloadButton.addEventListener('click', () => {
+    if (richState.mode !== 'source') {
+      startRender(richState, githubToken, routeState, true);
     }
+  });
+  viewportSelect.addEventListener('change', () => {
+    applyViewportWidth(richState);
+  });
+  fullscreenButton.addEventListener('click', () => {
+    void richState.container.requestFullscreen().catch((error: unknown) => {
+      richState.status.textContent =
+        error instanceof Error
+          ? `Full screen failed: ${error.message}`
+          : 'Full screen failed.';
+    });
+  });
+  link.addEventListener('click', (event) => {
+    if (richState.initialHead || richState.comparison) return;
+    event.preventDefault();
+    const pending = window.open('about:blank', '_blank');
+    if (pending) pending.opener = null;
+    void getPullComparison(routeState, githubToken)
+      .then((comparison) => {
+        richState.comparison = comparison;
+        const url = buildPreviewPageUrl(
+          sideRepoRef(comparison.head, target.path),
+          comparison.head.privateRepo,
+        );
+        richState.previewLink.href = url;
+        if (pending) pending.location.replace(url);
+      })
+      .catch((error: unknown) => {
+        pending?.close();
+        richState.status.textContent =
+          error instanceof Error
+            ? `Error: ${error.message}`
+            : 'Error: PR metadata unavailable.';
+      });
   });
 }
 
 function showSourceDiff(state: RichDiffState): void {
   state.controller?.abort();
   state.controller = null;
-  state.sourceButton.classList.add('selected');
-  state.sourceButton.setAttribute('aria-current', 'true');
-  state.richButton.classList.remove('selected');
-  state.richButton.removeAttribute('aria-current');
+  state.mode = 'source';
+  selectModeButton(state, state.sourceButton);
   state.container.style.display = 'none';
   state.target.fileContent.style.removeProperty('display');
 }
 
-function showRichDiff(state: RichDiffState): void {
-  state.sourceButton.classList.remove('selected');
-  state.sourceButton.removeAttribute('aria-current');
-  state.richButton.classList.add('selected');
-  state.richButton.setAttribute('aria-current', 'true');
+function showRenderedDiff(
+  state: RichDiffState,
+  mode: 'split' | 'after',
+): void {
+  state.mode = mode;
+  selectModeButton(
+    state,
+    mode === 'split' ? state.splitButton : state.afterButton,
+  );
+  state.basePane.style.display = mode === 'split' ? 'flex' : 'none';
+  state.headPane.style.display = 'flex';
+  state.comparisonArea.style.gridTemplateColumns =
+    mode === 'split' && state.container.clientWidth >= 900
+      ? 'minmax(0,1fr) minmax(0,1fr)'
+      : 'minmax(0,1fr)';
   state.target.fileContent.style.setProperty('display', 'none', 'important');
   state.container.style.display = 'flex';
 }
 
-async function renderRichDiff(
+function startRender(
   state: RichDiffState,
-  head: PullHead,
   githubToken: string | null,
   routeState: PrRouteState,
+  force: boolean,
+): void {
+  if (state.resolving) return;
+  state.resolving = renderRichComparison(
+    state,
+    githubToken,
+    routeState,
+    force,
+  ).finally(() => {
+    state.resolving = null;
+  });
+}
+
+async function renderRichComparison(
+  state: RichDiffState,
+  githubToken: string | null,
+  routeState: PrRouteState,
+  force: boolean,
 ): Promise<void> {
+  if (force) {
+    state.controller?.abort();
+    state.baseRender?.destroy();
+    state.headRender?.destroy();
+    state.baseRender = null;
+    state.headRender = null;
+    state.comparison = null;
+  }
   const controller = new AbortController();
   state.controller = controller;
   const abort = () => controller.abort();
   routeState.controller.signal.addEventListener('abort', abort, { once: true });
-  state.status.textContent = 'Loading HTML…';
-  const repoRef: RepoRef = {
-    owner: head.owner,
-    repo: head.repo,
-    ref: head.sha,
+  state.status.textContent = 'Loading comparison…';
+  debugLog('pr', 'rich-comparison-start', {
     path: state.target.path,
-  };
-  debugLog('pr', 'rich-diff-start', {
-    owner: head.owner,
-    repo: head.repo,
-    path: state.target.path,
-    privateRepo: head.privateRepo,
+    mode: state.mode,
     tokenConfigured: Boolean(githubToken),
   });
   try {
-    if (head.privateRepo && !githubToken) {
-      throw new Error(
-        'Save a fine-grained GitHub token in the extension popup to preview this private file.',
+    const comparison =
+      state.comparison ??
+      (state.mode === 'after' && state.initialHead
+        ? null
+        : await getPullComparison(routeState, githubToken));
+    if (comparison) {
+      state.comparison = comparison;
+      state.previewLink.href = buildPreviewPageUrl(
+        sideRepoRef(comparison.head, state.target.path),
+        comparison.head.privateRepo,
       );
     }
-    const file = await fetchRepositoryFile(repoRef, controller.signal, {
-      token: githubToken,
-      privateRepo: head.privateRepo,
-    });
-    const result = await resolveHtml(file.text, {
-      target: 'static',
-      repoRef,
-      githubToken,
-      privateRepo: head.privateRepo || file.authenticated,
-      signal: controller.signal,
-    });
+    const head = comparison?.head ?? state.initialHead;
+    if (!head) throw new Error('PR head metadata is unavailable.');
+
+    const jobs: Array<Promise<boolean>> = [];
+    if (state.mode === 'split' && !state.baseRender) {
+      if (!comparison) throw new Error('PR base metadata is unavailable.');
+      jobs.push(
+        renderComparisonSide(
+          state,
+          'base',
+          comparison.base,
+          githubToken,
+          controller.signal,
+        ),
+      );
+    }
+    if (!state.headRender) {
+      jobs.push(
+        renderComparisonSide(
+          state,
+          'head',
+          head,
+          githubToken,
+          controller.signal,
+        ),
+      );
+    }
+    const sideResults = await Promise.all(jobs);
     controller.signal.throwIfAborted();
-    if (!state.container.isConnected || routeState.controller.signal.aborted) return;
-    state.render?.destroy();
-    state.render = renderStaticPreview(state.previewArea, result, {
-      title: `Rich HTML diff for ${state.target.path}`,
-    });
+    applyViewportWidth(state);
     state.status.textContent =
-      result.resources.failed > 0 || result.resources.skipped > 0
-        ? 'Partial'
-        : 'Ready';
-    debugLog('pr', 'rich-diff-complete', {
+      sideResults.length > 0 && !sideResults.some(Boolean)
+        ? 'Error: No rendered version is available'
+        : sideResults.every(Boolean)
+        ? state.mode === 'split'
+          ? 'Before and after ready'
+          : 'After ready'
+        : 'Comparison partial';
+    debugLog('pr', 'rich-comparison-complete', {
       path: state.target.path,
-      fetched: result.resources.fetched,
-      inlined: result.resources.inlined,
-      failed: result.resources.failed,
-      skipped: result.resources.skipped,
+      mode: state.mode,
     });
   } catch (error) {
     if (controller.signal.aborted) return;
     state.status.textContent =
-      error instanceof Error ? `Error: ${error.message}` : 'Error: Preview failed.';
-    debugError('pr', 'rich-diff-failed', error, {
+      error instanceof Error
+        ? `Error: ${error.message}`
+        : 'Error: Comparison failed.';
+    debugError('pr', 'rich-comparison-failed', error, {
       path: state.target.path,
-      privateRepo: head.privateRepo,
     });
   } finally {
     routeState.controller.signal.removeEventListener('abort', abort);
@@ -621,46 +773,164 @@ async function renderRichDiff(
   }
 }
 
-function createDiffButton(
-  label: string,
-  stateClasses: string,
-  icon: SVGSVGElement,
-): HTMLButtonElement {
+async function renderComparisonSide(
+  state: RichDiffState,
+  sideName: 'base' | 'head',
+  side: PullSide,
+  githubToken: string | null,
+  signal: AbortSignal,
+): Promise<boolean> {
+  const repoRef = sideRepoRef(side, state.target.path);
+  const area = sideName === 'base' ? state.baseArea : state.headArea;
+  const label = sideName === 'base' ? state.baseLabel : state.headLabel;
+  label.textContent = `${sideName === 'base' ? 'Before' : 'After'} · ${side.sha.slice(0, 12)}`;
+  try {
+    if (side.privateRepo && !githubToken) {
+      throw new Error('Private repository access requires a saved GitHub token.');
+    }
+    const file = await fetchRepositoryFile(repoRef, signal, {
+      token: githubToken,
+      privateRepo: side.privateRepo,
+    });
+    const result = await resolveHtml(file.text, {
+      target: 'static',
+      repoRef,
+      githubToken,
+      privateRepo: side.privateRepo || file.authenticated,
+      signal,
+    });
+    signal.throwIfAborted();
+    const onScroll = (position: ScrollPosition) => {
+      if (!state.syncInput.checked) return;
+      if (sideName === 'base') state.headRender?.setScroll(position);
+      else state.baseRender?.setScroll(position);
+    };
+    const render = renderStaticPreview(area, result, {
+      title: `${sideName === 'base' ? 'Before' : 'After'} HTML preview for ${state.target.path}`,
+      onScroll,
+    });
+    if (sideName === 'base') {
+      state.baseRender?.destroy();
+      state.baseRender = render;
+    } else {
+      state.headRender?.destroy();
+      state.headRender = render;
+    }
+    return true;
+  } catch (error) {
+    if (signal.aborted) throw error;
+    area.replaceChildren(
+      createSideMessage(
+        sideName === 'base'
+          ? 'Base version unavailable. File may have been added.'
+          : 'Head version unavailable. File may have been deleted.',
+        error,
+      ),
+    );
+    debugError('pr', `${sideName}-preview-failed`, error, {
+      path: state.target.path,
+      ref: side.sha.slice(0, 12),
+    });
+    return false;
+  }
+}
+
+async function getPullComparison(
+  routeState: PrRouteState,
+  githubToken: string | null,
+): Promise<PullComparison> {
+  routeState.metadata ??= fetchPullComparison(
+    routeState.route,
+    routeState.controller.signal,
+    githubToken,
+  ).catch((error: unknown) => {
+    routeState.metadata = null;
+    throw error;
+  });
+  return routeState.metadata;
+}
+
+function selectModeButton(
+  state: RichDiffState,
+  selected: HTMLButtonElement,
+): void {
+  for (const button of [
+    state.sourceButton,
+    state.splitButton,
+    state.afterButton,
+  ]) {
+    const active = button === selected;
+    button.classList.toggle('selected', active);
+    if (active) button.setAttribute('aria-current', 'true');
+    else button.removeAttribute('aria-current');
+  }
+}
+
+function applyViewportWidth(state: RichDiffState): void {
+  const value = state.viewportSelect.value;
+  const width = value === 'responsive' ? '100%' : `${value}px`;
+  for (const area of [state.baseArea, state.headArea]) {
+    area.style.width = `min(100%, ${width})`;
+    area.style.marginInline = 'auto';
+  }
+}
+
+function createComparisonPane(labelText: string): {
+  pane: HTMLElement;
+  label: HTMLElement;
+  area: HTMLElement;
+} {
+  const pane = document.createElement('section');
+  pane.style.cssText =
+    'display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden;border-right:1px solid var(--borderColor-default,#d1d9e0);';
+  const label = document.createElement('div');
+  label.style.cssText =
+    'padding:5px 8px;background:var(--bgColor-muted,#f6f8fa);border-bottom:1px solid var(--borderColor-default,#d1d9e0);font-size:12px;font-weight:600;';
+  label.textContent = labelText;
+  const area = document.createElement('div');
+  area.style.cssText =
+    'flex:1;min-height:0;overflow:hidden;background:var(--bgColor-default,#fff);';
+  pane.append(label, area);
+  return { pane, label, area };
+}
+
+function createToolbarButton(label: string): HTMLButtonElement {
   const button = document.createElement('button');
   button.type = 'button';
-  button.className = `btn btn-sm BtnGroup-item tooltipped tooltipped-s ${stateClasses}`;
-  button.setAttribute('aria-label', label);
-  button.title = label;
-  button.appendChild(icon);
+  button.className = 'btn btn-sm';
+  button.textContent = label;
   return button;
 }
 
-function codeIcon(): SVGSVGElement {
-  return createIcon(
-    'M11.28 3.22 15.53 7.47a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L13.94 8l-3.72-3.72a.75.75 0 0 1 1.06-1.06Zm-6.56 0a.75.75 0 0 1 1.06 1.06L2.06 8l3.72 3.72a.75.75 0 1 1-1.06 1.06L.47 8.53a.75.75 0 0 1 0-1.06Z',
-    'octicon-code',
-  );
+function createTextDiffButton(
+  text: string,
+  label: string,
+): HTMLButtonElement {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'btn btn-sm BtnGroup-item';
+  button.textContent = text;
+  button.setAttribute('aria-label', label);
+  button.title = label;
+  return button;
 }
 
-function fileIcon(): SVGSVGElement {
-  return createIcon(
-    'M2 1.75C2 .784 2.784 0 3.75 0h6.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237v9.586A1.75 1.75 0 0 1 13.25 16h-9.5A1.75 1.75 0 0 1 2 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h9.5a.25.25 0 0 0 .25-.25V6h-2.75A1.75 1.75 0 0 1 9 4.25V1.5Z',
-    'octicon-file',
-  );
+function createSideMessage(message: string, error: unknown): HTMLElement {
+  const wrapper = document.createElement('div');
+  wrapper.style.cssText =
+    'display:grid;place-content:center;height:100%;padding:24px;color:var(--fgColor-muted,#59636e);text-align:center;';
+  const detail = error instanceof Error ? error.message : String(error);
+  wrapper.textContent = `${message} ${detail}`;
+  return wrapper;
 }
 
-function createIcon(pathData: string, iconClass: string): SVGSVGElement {
-  const namespace = 'http://www.w3.org/2000/svg';
-  const icon = document.createElementNS(namespace, 'svg');
-  icon.setAttribute('aria-hidden', 'true');
-  icon.setAttribute('height', '16');
-  icon.setAttribute('width', '16');
-  icon.setAttribute('viewBox', '0 0 16 16');
-  icon.setAttribute('class', `octicon ${iconClass}`);
-  const path = document.createElementNS(namespace, 'path');
-  path.setAttribute('d', pathData);
-  icon.appendChild(path);
-  return icon;
+function sideRepoRef(side: PullSide, path: string): RepoRef {
+  return {
+    owner: side.owner,
+    repo: side.repo,
+    ref: side.sha,
+    path,
+  };
 }
 
 function buildPreviewPageUrl(repoRef: RepoRef, privateRepo: boolean): string {

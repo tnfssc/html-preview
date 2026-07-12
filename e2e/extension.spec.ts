@@ -270,7 +270,7 @@ test('fork PR gets one preview link for exact head repository and commit', async
 
     const htmlDiff = page.locator('.file[data-path="examples/demo.html"]');
     const richButton = htmlDiff.getByRole('button', {
-      name: 'Display the rich diff',
+      name: 'Display the rendered PR head',
     });
     const sourceButton = htmlDiff.getByRole('button', {
       name: 'Display the source diff',
@@ -278,12 +278,16 @@ test('fork PR gets one preview link for exact head repository and commit', async
     await expect(richButton).toHaveClass(/BtnGroup-item/);
     await richButton.click();
     const richContainer = htmlDiff.locator('.gh-html-preview-pr-rich');
-    await expect(richContainer.getByRole('status')).toHaveText('Partial');
+    await expect(richContainer.getByRole('status')).toHaveText('After ready');
     const richFrame = richContainer
-      .locator('iframe[title="Rich HTML diff for examples/demo.html"]')
+      .locator('iframe[title="After HTML preview for examples/demo.html"]')
       .contentFrame();
     await expect(richFrame.locator('#rich-pr')).toHaveText('Rich PR HTML');
-    await expect(richFrame.locator('script')).toHaveCount(0);
+    expect(
+      await richFrame
+        .locator('body')
+        .evaluate(() => Reflect.has(globalThis, 'unsafe')),
+    ).toBe(false);
     await expect(htmlDiff.locator('.js-file-content')).toBeHidden();
     await sourceButton.click();
     await expect(htmlDiff.locator('.js-file-content')).toBeVisible();
@@ -306,7 +310,9 @@ test('fork PR gets one preview link for exact head repository and commit', async
     await expect(
       page
         .locator('.file[data-path="examples/late.htm"]')
-        .getByRole('button', { name: 'Display the rich diff' }),
+        .getByRole('button', {
+          name: 'Display synchronized before and after previews',
+        }),
     ).toHaveCount(1);
     expect(apiRequests).toBe(0);
   } finally {
@@ -317,9 +323,12 @@ test('fork PR gets one preview link for exact head repository and commit', async
 test('authenticated changes DOM receives HTML source and rich diff controls', async () => {
   const { context, page } = await launchWithExtension();
   const prUrl = 'https://github.com/acme/reports/pull/43/changes';
+  const baseSha = 'abcdeabcdeabcdeabcdeabcdeabcdeabcdeabcde';
   const headSha = '1234512345123451234512345123451234512345';
   const filePath = 'examples/react-diff.html';
   let apiRequests = 0;
+  let baseFileRequests = 0;
+  let headFileRequests = 0;
   try {
     await context.route('**/*', async (route) => {
       const url = route.request().url();
@@ -337,6 +346,10 @@ test('authenticated changes DOM receives HTML source and rich diff controls', as
           status: 200,
           contentType: 'application/json',
           body: JSON.stringify({
+            base: {
+              sha: baseSha,
+              repo: { full_name: 'acme/reports', private: false },
+            },
             head: {
               sha: headSha,
               repo: { full_name: 'contributor/reports-fork', private: false },
@@ -347,12 +360,25 @@ test('authenticated changes DOM receives HTML source and rich diff controls', as
       }
       if (
         url ===
-        `https://raw.githubusercontent.com/contributor/reports-fork/${headSha}/${filePath}`
+        `https://raw.githubusercontent.com/acme/reports/${baseSha}/${filePath}`
       ) {
+        baseFileRequests += 1;
         await route.fulfill({
           status: 200,
           contentType: 'text/html',
-          body: '<!doctype html><html><body><h1 id="react-rich">Authenticated changes preview</h1></body></html>',
+          body: '<!doctype html><html><body style="margin:0;width:1600px;height:3000px"><h1 id="before-rich">Before version</h1><div style="margin-top:2800px">Before end</div></body></html>',
+        });
+        return;
+      }
+      if (
+        url ===
+        `https://raw.githubusercontent.com/contributor/reports-fork/${headSha}/${filePath}`
+      ) {
+        headFileRequests += 1;
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: '<!doctype html><html><body style="margin:0;width:1600px;height:3000px"><h1 id="react-rich">After version</h1><div style="margin-top:2800px">After end</div></body></html>',
         });
         return;
       }
@@ -367,24 +393,178 @@ test('authenticated changes DOM receives HTML source and rich diff controls', as
       }),
     ).toBeVisible();
     const richButton = region.getByRole('button', {
-      name: 'Display the rich diff',
+      name: 'Display synchronized before and after previews',
     });
     await expect(richButton).toBeVisible();
     await richButton.click();
     const richContainer = region.locator('.gh-html-preview-pr-rich');
-    await expect(richContainer.getByRole('status')).toHaveText('Ready');
-    const frame = richContainer
-      .locator(`iframe[title="Rich HTML diff for ${filePath}"]`)
-      .contentFrame();
-    await expect(frame.locator('#react-rich')).toHaveText(
-      'Authenticated changes preview',
+    await expect(richContainer.getByRole('status')).toHaveText(
+      'Before and after ready',
     );
+    const beforeIframe = richContainer.locator(
+      `iframe[title="Before HTML preview for ${filePath}"]`,
+    );
+    const afterIframe = richContainer.locator(
+      `iframe[title="After HTML preview for ${filePath}"]`,
+    );
+    const beforeFrame = beforeIframe.contentFrame();
+    const afterFrame = afterIframe.contentFrame();
+    await expect(beforeFrame.locator('#before-rich')).toHaveText(
+      'Before version',
+    );
+    await expect(afterFrame.locator('#react-rich')).toHaveText('After version');
+    const beforeHandle = await beforeIframe.elementHandle();
+    const afterHandle = await afterIframe.elementHandle();
+    const beforePageFrame = await beforeHandle?.contentFrame();
+    const afterPageFrame = await afterHandle?.contentFrame();
+    expect(beforePageFrame).not.toBeNull();
+    expect(afterPageFrame).not.toBeNull();
+    expect(
+      await beforePageFrame!.evaluate(
+        () =>
+          (
+            globalThis as typeof globalThis & {
+              __ghHtmlPreviewScrollBridge?: boolean;
+            }
+          ).__ghHtmlPreviewScrollBridge,
+      ),
+    ).toBe(true);
+    await beforePageFrame!.evaluate(() => scrollTo(700, 2000));
+    expect(await beforePageFrame!.evaluate(() => scrollY)).toBeGreaterThan(1000);
+    await expect
+      .poll(() => afterPageFrame!.evaluate(() => scrollY))
+      .toBeGreaterThan(1000);
+    await expect
+      .poll(() => afterPageFrame!.evaluate(() => scrollX))
+      .toBeGreaterThan(300);
+
+    await richContainer
+      .getByRole('checkbox', { name: 'Synchronize preview scrolling' })
+      .uncheck();
+    const unsyncedY = await afterPageFrame!.evaluate(() => scrollY);
+    await beforePageFrame!.evaluate(() => scrollTo(0, 0));
+    await delay(200);
+    expect(await afterPageFrame!.evaluate(() => scrollY)).toBe(unsyncedY);
+
+    await richContainer
+      .getByRole('combobox', { name: 'Preview viewport width' })
+      .selectOption('390');
+    expect((await beforeIframe.boundingBox())?.width).toBeLessThanOrEqual(390);
+    expect((await afterIframe.boundingBox())?.width).toBeLessThanOrEqual(390);
+
+    await richContainer.getByRole('button', { name: 'Reload' }).click();
+    await expect(richContainer.getByRole('status')).toHaveText(
+      'Before and after ready',
+    );
+    expect(baseFileRequests).toBe(2);
+    expect(headFileRequests).toBe(2);
+
+    await region
+      .getByRole('button', { name: 'Display the rendered PR head' })
+      .click();
+    await expect(beforeIframe).toBeHidden();
+    await expect(afterIframe).toBeVisible();
+    await expect(
+      richContainer.getByRole('button', { name: 'Full screen' }),
+    ).toBeVisible();
+    await richContainer.getByRole('button', { name: 'Full screen' }).click();
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          document.fullscreenElement?.classList.contains(
+            'gh-html-preview-pr-rich',
+          ),
+        ),
+      )
+      .toBe(true);
+    await page.evaluate(() => document.exitFullscreen());
+    await expect
+      .poll(() => page.evaluate(() => document.fullscreenElement === null))
+      .toBe(true);
     await expect(region.locator('.border')).toBeHidden();
     await region
       .getByRole('button', { name: 'Display the source diff' })
       .click();
     await expect(region.locator('.border')).toBeVisible();
     expect(apiRequests).toBe(1);
+  } finally {
+    await context.close();
+  }
+});
+
+test('split comparison represents an added HTML file without failing head preview', async () => {
+  const { context, page } = await launchWithExtension();
+  const prUrl = 'https://github.com/acme/reports/pull/44/changes';
+  const baseSha = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  const headSha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const filePath = 'examples/added.html';
+  try {
+    await context.route('**/*', async (route) => {
+      const url = route.request().url();
+      if (url === prUrl) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: githubReactPrFixture(filePath),
+        });
+        return;
+      }
+      if (url === 'https://api.github.com/repos/acme/reports/pulls/44') {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            base: {
+              sha: baseSha,
+              repo: { full_name: 'acme/reports', private: false },
+            },
+            head: {
+              sha: headSha,
+              repo: { full_name: 'acme/reports', private: false },
+            },
+          }),
+        });
+        return;
+      }
+      if (
+        url ===
+        `https://raw.githubusercontent.com/acme/reports/${baseSha}/${filePath}`
+      ) {
+        await route.fulfill({ status: 404, body: 'missing' });
+        return;
+      }
+      if (
+        url ===
+        `https://raw.githubusercontent.com/acme/reports/${headSha}/${filePath}`
+      ) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: '<!doctype html><html><body><h1 id="added-head">Added file</h1></body></html>',
+        });
+        return;
+      }
+      await route.continue();
+    });
+
+    await page.goto(prUrl, { waitUntil: 'domcontentloaded' });
+    const region = page.locator('[role="region"][id^="diff-"]');
+    await region
+      .getByRole('button', {
+        name: 'Display synchronized before and after previews',
+      })
+      .click();
+    const comparison = region.locator('.gh-html-preview-pr-rich');
+    await expect(comparison.getByRole('status')).toHaveText(
+      'Comparison partial',
+    );
+    await expect(comparison).toContainText(
+      'Base version unavailable. File may have been added.',
+    );
+    const after = comparison
+      .locator(`iframe[title="After HTML preview for ${filePath}"]`)
+      .contentFrame();
+    await expect(after.locator('#added-head')).toHaveText('Added file');
   } finally {
     await context.close();
   }
@@ -547,6 +727,13 @@ test('private blob and executable preview use local token without exposing it', 
           status: 200,
           contentType: 'application/json',
           body: JSON.stringify({
+            base: {
+              sha: commit,
+              repo: {
+                full_name: 'private-owner/private-repo',
+                private: true,
+              },
+            },
             head: {
               sha: commit,
               repo: {
@@ -748,6 +935,33 @@ test('private blob and executable preview use local token without exposing it', 
           authorization === `Bearer ${privateToken}`,
       ),
     ).toBe(true);
+
+    const privateDiff = prPage.locator(
+      '.file[data-path="report/index.html"]',
+    );
+    await privateDiff
+      .getByRole('button', {
+        name: 'Display synchronized before and after previews',
+      })
+      .click();
+    const privateComparison = privateDiff.locator(
+      '.gh-html-preview-pr-rich',
+    );
+    await expect(privateComparison.getByRole('status')).toHaveText(
+      'Before and after ready',
+    );
+    await expect(
+      privateComparison
+        .locator('iframe[title^="Before HTML preview"]')
+        .contentFrame()
+        .locator('#private-title'),
+    ).toHaveText('Private report');
+    await expect(
+      privateComparison
+        .locator('iframe[title^="After HTML preview"]')
+        .contentFrame()
+        .locator('#private-title'),
+    ).toHaveText('Private report');
   } finally {
     await context.close();
   }

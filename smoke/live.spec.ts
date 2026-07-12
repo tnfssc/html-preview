@@ -84,19 +84,26 @@ test('current GitHub PR UI receives HTML preview link', async () => {
 
     const htmlDiff = page.locator(`[data-path="${prHtmlPath}"]`).locator('..');
     const richButton = htmlDiff.getByRole('button', {
-      name: 'Display the rich diff',
+      name: 'Display synchronized before and after previews',
     });
     await expect(richButton).toBeVisible();
     await richButton.click();
     const richContainer = htmlDiff.locator('.gh-html-preview-pr-rich');
-    await expect(richContainer.getByRole('status')).toHaveText(/Ready|Partial/, {
-      timeout: 20_000,
-    });
-    const frame = richContainer
-      .locator(`iframe[title="Rich HTML diff for ${prHtmlPath}"]`)
+    await expect(richContainer.getByRole('status')).toHaveText(
+      'Before and after ready',
+      { timeout: 20_000 },
+    );
+    const beforeFrame = richContainer
+      .locator(`iframe[title="Before HTML preview for ${prHtmlPath}"]`)
       .contentFrame();
     await expect(
-      frame.getByRole('heading', { name: 'Number guessing game' }),
+      beforeFrame.getByRole('heading', { name: 'Number guessing game' }),
+    ).toBeVisible();
+    const afterFrame = richContainer
+      .locator(`iframe[title="After HTML preview for ${prHtmlPath}"]`)
+      .contentFrame();
+    await expect(
+      afterFrame.getByRole('heading', { name: 'Number guessing game' }),
     ).toBeVisible();
     await htmlDiff
       .getByRole('button', { name: 'Display the source diff' })

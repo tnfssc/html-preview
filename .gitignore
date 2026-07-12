@@ -17,6 +17,7 @@ PRODUCT.md
 skills-lock.json
 test-results
 playwright-report
+*.mhtml
 stats.html
 stats-*.json
 .wxt

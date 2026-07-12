@@ -14,7 +14,7 @@ const PREVIEW_LINK_CLASS = 'gh-html-preview-pr-link';
 const PREVIEW_CONTROLS_CLASS = 'gh-html-preview-pr-controls';
 const RICH_CONTAINER_CLASS = 'gh-html-preview-pr-rich';
 const DIFF_SELECTOR =
-  '#files .file, [data-testid="diff-file"], [data-testid="diff-file-header"]';
+  '#files .file, [data-testid="diff-file"], [data-testid="diff-file-header"], [data-diff-header-wrapper], [role="region"][id^="diff-"]';
 
 interface PullHead {
   owner: string;
@@ -95,6 +95,8 @@ export default defineContentScript({
         testHeaders: document.querySelectorAll(
           '[data-testid="diff-file-header"], [data-testid="file-header"]',
         ).length,
+        reactHeaders: document.querySelectorAll('[data-diff-header-wrapper]')
+          .length,
         htmlDataPaths: Array.from(
           document.querySelectorAll<HTMLElement>('[data-path]'),
         ).filter((element) => validHtmlPath(element.dataset.path)).length,
@@ -364,6 +366,47 @@ function findDiffTargets(): DiffTarget[] {
       });
     }
   }
+
+  for (const wrapper of Array.from(
+    document.querySelectorAll<HTMLElement>('[data-diff-header-wrapper]'),
+  )) {
+    const file = wrapper.closest<HTMLElement>('[role="region"][id^="diff-"]');
+    const header = wrapper.firstElementChild;
+    const table = file?.querySelector<HTMLTableElement>(
+      'table[aria-label^="Diff for:"]',
+    );
+    const fileContent = table?.closest<HTMLElement>(
+      '.border, [data-testid="diff-file-content"]',
+    );
+    const path =
+      file
+        ?.querySelector<HTMLElement>('[data-file-path]')
+        ?.getAttribute('data-file-path') ??
+      table?.getAttribute('aria-label')?.replace(/^Diff for:\s*/, '') ??
+      null;
+    const actions =
+      header instanceof HTMLElement && header.lastElementChild instanceof HTMLElement
+        ? header.lastElementChild
+        : null;
+    if (
+      file &&
+      header instanceof HTMLElement &&
+      fileContent &&
+      actions &&
+      validHtmlPath(path) &&
+      !seen.has(header)
+    ) {
+      seen.add(header);
+      targets.push({
+        file,
+        header,
+        fileContent,
+        actions,
+        path,
+        repoRef: findViewFileRepoRef(header, path),
+      });
+    }
+  }
   return targets;
 }
 
@@ -407,6 +450,7 @@ function insertPreviewControls(
   });
   const controls = document.createElement('div');
   controls.className = `${PREVIEW_CONTROLS_CLASS} BtnGroup d-inline-flex`;
+  controls.style.cssText = 'display:inline-flex;flex-shrink:0;';
 
   const sourceButton = createDiffButton(
     'Display the source diff',
@@ -437,6 +481,8 @@ function insertPreviewControls(
   );
   link.target = '_blank';
   link.rel = 'noreferrer';
+  link.style.cssText =
+    'display:inline-flex;align-items:center;white-space:nowrap;flex-shrink:0;';
 
   const container = document.createElement('section');
   container.className = RICH_CONTAINER_CLASS;

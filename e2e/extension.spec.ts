@@ -314,6 +314,82 @@ test('fork PR gets one preview link for exact head repository and commit', async
   }
 });
 
+test('authenticated changes DOM receives HTML source and rich diff controls', async () => {
+  const { context, page } = await launchWithExtension();
+  const prUrl = 'https://github.com/acme/reports/pull/43/changes';
+  const headSha = '1234512345123451234512345123451234512345';
+  const filePath = 'examples/react-diff.html';
+  let apiRequests = 0;
+  try {
+    await context.route('**/*', async (route) => {
+      const url = route.request().url();
+      if (url === prUrl) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: githubReactPrFixture(filePath),
+        });
+        return;
+      }
+      if (url === 'https://api.github.com/repos/acme/reports/pulls/43') {
+        apiRequests += 1;
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            head: {
+              sha: headSha,
+              repo: { full_name: 'contributor/reports-fork', private: false },
+            },
+          }),
+        });
+        return;
+      }
+      if (
+        url ===
+        `https://raw.githubusercontent.com/contributor/reports-fork/${headSha}/${filePath}`
+      ) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: '<!doctype html><html><body><h1 id="react-rich">Authenticated changes preview</h1></body></html>',
+        });
+        return;
+      }
+      await route.continue();
+    });
+
+    await page.goto(prUrl, { waitUntil: 'domcontentloaded' });
+    const region = page.locator('[role="region"][id^="diff-"]');
+    await expect(
+      region.getByRole('link', {
+        name: `Open full preview for ${filePath}`,
+      }),
+    ).toBeVisible();
+    const richButton = region.getByRole('button', {
+      name: 'Display the rich diff',
+    });
+    await expect(richButton).toBeVisible();
+    await richButton.click();
+    const richContainer = region.locator('.gh-html-preview-pr-rich');
+    await expect(richContainer.getByRole('status')).toHaveText('Ready');
+    const frame = richContainer
+      .locator(`iframe[title="Rich HTML diff for ${filePath}"]`)
+      .contentFrame();
+    await expect(frame.locator('#react-rich')).toHaveText(
+      'Authenticated changes preview',
+    );
+    await expect(region.locator('.border')).toBeHidden();
+    await region
+      .getByRole('button', { name: 'Display the source diff' })
+      .click();
+    await expect(region.locator('.border')).toBeVisible();
+    expect(apiRequests).toBe(1);
+  } finally {
+    await context.close();
+  }
+});
+
 test('SPA navigation cancels stale resource work and renders only new file', async () => {
   const slowHtml =
     '<!doctype html><html><body><h2 id="file-a">File A</h2><img src="./slow.png"></body></html>';
@@ -747,6 +823,30 @@ function githubPrFixture(filePath: string, viewFileHref?: string): string {
       <div class="js-file-content">Source diff for ${filePath}</div>
     </div>
   </div></body></html>`;
+}
+
+function githubReactPrFixture(filePath: string): string {
+  return `<!doctype html><html><body>
+    <div class="PullRequestDiffsList">
+      <div role="region" id="diff-authenticated-react">
+        <div data-diff-header-wrapper>
+          <div class="DiffFileHeader">
+            <div><button type="button">Collapse</button></div>
+            <div class="file-path">
+              <h3><a href="#diff-authenticated-react"><code>${filePath}</code></a></h3>
+              <button type="button" data-file-path="${filePath}">Expand all lines</button>
+            </div>
+            <div class="d-flex flex-row flex-justify-end flex-items-center gap-2 flex-1">
+              <button type="button">More options</button>
+            </div>
+          </div>
+        </div>
+        <div class="border position-relative rounded-bottom-2">
+          <table aria-label="Diff for: ${filePath}"><tbody><tr><td>Source diff</td></tr></tbody></table>
+        </div>
+      </div>
+    </div>
+  </body></html>`;
 }
 
 function githubBlobFixtureWithoutSource(oid: string, filePath: string): string {

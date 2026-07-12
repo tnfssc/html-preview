@@ -50,6 +50,6 @@ describe('packaged Chrome extension', () => {
   it('contains release-grade product identity', async () => {
     const manifest = await readManifest();
     expect(manifest.name).toBe('GitHub HTML Preview');
-    expect(manifest.version).toBe('0.2.1');
+    expect(manifest.version).toBe('0.2.2');
   });
 });

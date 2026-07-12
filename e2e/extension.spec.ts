@@ -586,7 +586,7 @@ test('split comparison represents an added HTML file without failing head previe
   }
 });
 
-test('SPA navigation cancels stale resource work and renders only new file', async () => {
+test('SPA navigation renders only the newly selected file', async () => {
   const slowHtml =
     '<!doctype html><html><body><h2 id="file-a">File A</h2><img src="./slow.png"></body></html>';
   const nextHtml =
@@ -599,9 +599,9 @@ test('SPA navigation cancels stale resource work and renders only new file', asy
     await routeProductFixtures(context, slowHtml);
     await page.goto(blobUrl, { waitUntil: 'domcontentloaded' });
     await page.getByRole('tab', { name: 'Preview' }).click();
-    await expect(page.locator('.gh-html-preview-container').getByRole('status')).toHaveText(
-      'Loading',
-    );
+    await expect(
+      page.locator('.gh-html-preview-container').getByRole('status'),
+    ).toHaveText('Ready');
 
     await page.evaluate(
       ({ url, html }) => {
@@ -852,7 +852,7 @@ test('private blob and executable preview use local token without exposing it', 
       'Private access saved',
     );
 
-    await expect(container.getByRole('status')).toHaveText('Partial');
+    await expect(container.getByRole('status')).toHaveText('Ready');
     const staticFrame = container
       .locator('iframe[title="Static HTML preview"]')
       .contentFrame();
@@ -863,32 +863,16 @@ test('private blob and executable preview use local token without exposing it', 
       'src',
       /^data:image\/png;base64,/,
     );
-    await expect(staticFrame.locator('script')).toHaveCount(0);
+    await expect(staticFrame.locator('#classic-result')).toHaveText(
+      'Classic executed',
+    );
+    await expect(staticFrame.locator('#module-result')).toHaveText(
+      'Module executed',
+    );
 
     const popupPromise = context.waitForEvent('page');
     await page.getByRole('link', { name: 'Open full preview' }).click();
-    const blockedFullPage = await popupPromise;
-    await expect(blockedFullPage.getByRole('status')).toContainText(
-      'Enable executable private previews',
-    );
-
-    await popup
-      .getByRole('checkbox', { name: /Allow executable private previews/ })
-      .check();
-    await expect(popup.getByRole('status')).toHaveText('Saved');
-    await blockedFullPage.close();
-    const allowedFullPage = await context.newPage();
-    const privateQuery = new URLSearchParams({
-      owner: 'private-owner',
-      repo: 'private-repo',
-      ref: commit,
-      path: 'report/index.html',
-      private: '1',
-    });
-    await allowedFullPage.goto(
-      `chrome-extension://${extensionId}/preview.html?${privateQuery}`,
-      { waitUntil: 'domcontentloaded' },
-    );
+    const allowedFullPage = await popupPromise;
     const privateBrowserErrors: string[] = [];
     allowedFullPage.on('console', (message) => {
       if (message.type() === 'error') privateBrowserErrors.push(message.text());

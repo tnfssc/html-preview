@@ -1,10 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { fetchRepositoryFile } from '@/utils/github';
 import { resolveHtml } from '@/utils/resolveHtml';
-import {
-  githubTokenStorage,
-  privateFullPreviewStorage,
-} from '@/utils/storage';
+import { githubTokenStorage } from '@/utils/storage';
 import {
   SANDBOX_RENDER,
   isSandboxReadyMessage,
@@ -70,10 +67,7 @@ export default function App(): React.JSX.Element {
 
     void (async () => {
       try {
-        const [githubToken, privateFullPreview] = await Promise.all([
-          githubTokenStorage.getValue(),
-          privateFullPreviewStorage.getValue(),
-        ]);
+        const githubToken = await githubTokenStorage.getValue();
         debugLog('preview', 'load-start', {
           owner: repoRef.owner,
           repo: repoRef.repo,
@@ -81,16 +75,10 @@ export default function App(): React.JSX.Element {
           path: repoRef.path,
           privateRepo: request.privateRepo,
           tokenConfigured: Boolean(githubToken),
-          privateExecutionEnabled: privateFullPreview,
         });
         if (request.privateRepo && !githubToken) {
           throw new Error(
             'Save a fine-grained GitHub token in the extension popup to open this private file.',
-          );
-        }
-        if (request.privateRepo && !privateFullPreview) {
-          throw new Error(
-            'Enable executable private previews in the extension popup. Private repository scripts may transmit private content.',
           );
         }
         const file = await fetchRepositoryFile(repoRef, controller.signal, {
@@ -98,11 +86,6 @@ export default function App(): React.JSX.Element {
           privateRepo: request.privateRepo,
         });
         const privateRepo = request.privateRepo || file.authenticated;
-        if (privateRepo && !privateFullPreview) {
-          throw new Error(
-            'Enable executable private previews in the extension popup. Private repository scripts may transmit private content.',
-          );
-        }
         setState({ kind: 'loading', message: 'Resolving repository URLs…' });
         const result = await resolveHtml(file.text, {
           target: privateRepo ? 'sandbox-private' : 'sandbox',

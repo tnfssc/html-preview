@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react';
 import {
   enabledStorage,
   githubTokenStorage,
-  privateFullPreviewStorage,
 } from '@/utils/storage';
 import './App.css';
 import { debugError, debugLog } from '@/utils/debug';
@@ -23,7 +22,6 @@ const TOKEN_CREATION_URL = `https://github.com/settings/personal-access-tokens/n
 export default function App(): React.JSX.Element {
   const [enabled, setEnabled] = useState(true);
   const [token, setToken] = useState('');
-  const [privateFullPreview, setPrivateFullPreview] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>('idle');
   const [message, setMessage] = useState('');
@@ -31,15 +29,12 @@ export default function App(): React.JSX.Element {
   useEffect(() => {
     async function load() {
       try {
-        const [storedEnabled, storedToken, storedPrivateFullPreview] =
-          await Promise.all([
-            enabledStorage.getValue(),
-            githubTokenStorage.getValue(),
-            privateFullPreviewStorage.getValue(),
-          ]);
+        const [storedEnabled, storedToken] = await Promise.all([
+          enabledStorage.getValue(),
+          githubTokenStorage.getValue(),
+        ]);
         setEnabled(storedEnabled);
         setToken(storedToken ?? '');
-        setPrivateFullPreview(storedPrivateFullPreview);
         setLoaded(true);
       } catch {
         setSaveState('error');
@@ -108,32 +103,13 @@ export default function App(): React.JSX.Element {
     setSaveState('saving');
     setMessage('Removing private access…');
     try {
-      await Promise.all([
-        githubTokenStorage.setValue(null),
-        privateFullPreviewStorage.setValue(false),
-      ]);
+      await githubTokenStorage.setValue(null);
       setToken('');
-      setPrivateFullPreview(false);
       setSaveState('saved');
       setMessage('Private access removed.');
     } catch {
       setSaveState('error');
       setMessage('Could not remove private access.');
-    }
-  }
-
-  async function updatePrivateFullPreview(next: boolean) {
-    setPrivateFullPreview(next);
-    setSaveState('saving');
-    setMessage('Saving…');
-    try {
-      await privateFullPreviewStorage.setValue(next);
-      setSaveState('saved');
-      setMessage('Saved');
-    } catch {
-      setPrivateFullPreview(!next);
-      setSaveState('error');
-      setMessage('Could not save setting.');
     }
   }
 
@@ -198,21 +174,6 @@ export default function App(): React.JSX.Element {
           </button>
         </div>
       </form>
-
-      <label className="row warning-row">
-        <input
-          type="checkbox"
-          checked={privateFullPreview}
-          onChange={(event) =>
-            void updatePrivateFullPreview(event.target.checked)
-          }
-          disabled={!loaded || !token || saveState === 'saving'}
-        />
-        <span>
-          Allow executable private previews. Repository scripts can transmit
-          private content to external servers.
-        </span>
-      </label>
 
       {import.meta.env.MODE === 'debug' && (
         <div className="section">

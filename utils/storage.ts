@@ -9,20 +9,13 @@ export const githubTokenStorage = storage.defineItem<string | null>(
   { fallback: null },
 );
 
-export const privateFullPreviewStorage = storage.defineItem<boolean>(
-  'local:privateFullPreview',
-  { fallback: false },
-);
-
 export async function getSettings(): Promise<{
   enabled: boolean;
   githubToken: string | null;
-  privateFullPreview: boolean;
 }> {
-  const [enabled, githubToken, privateFullPreview] = await Promise.all([
+  const [enabled, githubToken] = await Promise.all([
     enabledStorage.getValue(),
     githubTokenStorage.getValue(),
-    privateFullPreviewStorage.getValue(),
   ]);
-  return { enabled, githubToken, privateFullPreview };
+  return { enabled, githubToken };
 }

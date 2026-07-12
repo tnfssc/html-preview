@@ -3,7 +3,7 @@ import type { RepoRef } from './types';
 export interface BlobPageData {
   html: string | null;
   repoRef: RepoRef | null;
-  source: 'embedded' | 'url-fallback' | 'unavailable';
+  source: 'code-view' | 'embedded' | 'url-fallback' | 'unavailable';
   diagnostic: string | null;
 }
 
@@ -45,15 +45,18 @@ export function parsePrFilesUrl(url: string | URL): PrFilesRoute | null {
 
 export function extractBlobPageData(): BlobPageData {
   const fallback = parseBlobUrl(location.href);
+  const codeViewSource = extractCodeViewSource();
   const script = document.querySelector(
     'script[data-target="react-app.embeddedData"]',
   );
   if (!script?.textContent) {
     return {
-      html: null,
+      html: codeViewSource,
       repoRef: fallback,
-      source: fallback ? 'url-fallback' : 'unavailable',
-      diagnostic: fallback
+      source: codeViewSource ? 'code-view' : fallback ? 'url-fallback' : 'unavailable',
+      diagnostic: codeViewSource
+        ? null
+        : fallback
         ? 'GitHub embedded file data is not available yet; URL parsing cannot disambiguate refs containing slashes.'
         : 'GitHub embedded file data is unavailable.',
     };
@@ -70,10 +73,11 @@ export function extractBlobPageData(): BlobPageData {
       payloadRecord?.['codeViewBlobLayoutRoute.StyledBlob'],
     );
     const rawLines = styledBlob?.rawLines ?? payloadRecord?.rawLines;
-    const html =
+    const embeddedHtml =
       Array.isArray(rawLines) && rawLines.every((line) => typeof line === 'string')
         ? rawLines.join('\n')
         : null;
+    const html = codeViewSource ?? embeddedHtml;
 
     const owner = stringValue(repo?.ownerLogin) ?? fallbackRef?.owner;
     const repoName = stringValue(repo?.name) ?? fallbackRef?.repo;
@@ -82,10 +86,13 @@ export function extractBlobPageData(): BlobPageData {
       stringValue(payloadRecord?.currentOid) ??
       stringValue(refInfo?.name) ??
       fallbackRef?.ref;
-    const path =
+    const embeddedPath =
       stringValue(payloadRecord?.path) ??
-      stringValue(styledBlob?.path) ??
-      fallbackRef?.path;
+      stringValue(styledBlob?.path);
+    const path =
+      embeddedPath && pathMatchesLocation(embeddedPath)
+        ? embeddedPath
+        : fallbackRef?.path ?? embeddedPath;
 
     if (owner && repoName && ref && path) {
       const usedCanonicalPayload =
@@ -94,8 +101,12 @@ export function extractBlobPageData(): BlobPageData {
       return {
         html,
         repoRef: { owner, repo: repoName, ref, path },
-        source: usedCanonicalPayload ? 'embedded' : 'url-fallback',
-        diagnostic: usedCanonicalPayload
+        source: codeViewSource
+          ? 'code-view'
+          : usedCanonicalPayload
+            ? 'embedded'
+            : 'url-fallback',
+        diagnostic: codeViewSource || usedCanonicalPayload
           ? null
           : 'Canonical commit SHA was absent from GitHub embedded data; preview uses route ref fallback.',
       };
@@ -112,10 +123,12 @@ export function extractBlobPageData(): BlobPageData {
   } catch (error) {
     console.error('[gh-html-preview] failed to parse embedded data:', error);
     return {
-      html: null,
+      html: codeViewSource,
       repoRef: fallback,
-      source: fallback ? 'url-fallback' : 'unavailable',
-      diagnostic: fallback
+      source: codeViewSource ? 'code-view' : fallback ? 'url-fallback' : 'unavailable',
+      diagnostic: codeViewSource
+        ? null
+        : fallback
         ? 'GitHub embedded data was malformed; preview uses route parsing fallback.'
         : 'GitHub embedded data was malformed.',
     };
@@ -220,4 +233,20 @@ function decodeSegment(segment: string): string {
   } catch {
     return segment;
   }
+}
+
+function extractCodeViewSource(): string | null {
+  const textarea = document.querySelector<HTMLTextAreaElement>(
+    'textarea[aria-label="file content"]',
+  );
+  return textarea?.value || null;
+}
+
+function pathMatchesLocation(path: string): boolean {
+  const encoded = path
+    .replace(/^\/+/, '')
+    .split('/')
+    .map(encodeURIComponent)
+    .join('/');
+  return location.pathname.endsWith(`/${encoded}`);
 }

@@ -22,8 +22,9 @@ export function renderStaticPreview(
   iframe.setAttribute('sandbox', '');
   iframe.style.width = '100%';
   iframe.style.height = options?.height ?? '100%';
+  iframe.style.display = 'block';
   iframe.style.border = 'none';
-  iframe.style.minHeight = '400px';
+  iframe.style.minHeight = '0';
   container.replaceChildren(iframe);
 
   return {

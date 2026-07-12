@@ -23,6 +23,8 @@ interface RouteState {
   readonly controller: AbortController;
   readonly tab: HTMLElement;
   readonly tabButton: HTMLButtonElement;
+  readonly tabBar: HTMLElement;
+  readonly nativeListenerCleanup: Array<() => void>;
   readonly container: HTMLElement;
   readonly previewArea: HTMLElement;
   readonly status: HTMLElement;
@@ -41,6 +43,7 @@ export default defineContentScript({
     let generation = 0;
     let state: RouteState | null = null;
     let reconcileTimer: number | null = null;
+    let lastLocation = location.href;
 
     const teardown = () => {
       generation += 1;
@@ -54,6 +57,7 @@ export default defineContentScript({
       }
       state.controller.abort();
       state.render?.destroy();
+      state.nativeListenerCleanup.forEach((cleanup) => cleanup());
       if (state.codeView.isConnected) state.codeView.style.removeProperty('display');
       state.tab.remove();
       state.container.remove();
@@ -61,11 +65,10 @@ export default defineContentScript({
       removeOrphanedUi();
     };
 
-    const showCode = () => {
+    const showCode = (selectedButton?: HTMLButtonElement) => {
       if (!state) return;
       state.active = false;
-      state.tabButton.setAttribute('aria-selected', 'false');
-      state.tabButton.removeAttribute('aria-current');
+      setSelectedTab(state.tabBar, selectedButton ?? null);
       state.container.style.setProperty('display', 'none', 'important');
       state.codeView.style.removeProperty('display');
     };
@@ -73,8 +76,7 @@ export default defineContentScript({
     const showPreview = () => {
       if (!state) return;
       state.active = true;
-      state.tabButton.setAttribute('aria-selected', 'true');
-      state.tabButton.setAttribute('aria-current', 'page');
+      setSelectedTab(state.tabBar, state.tabButton);
       state.container.style.setProperty('display', 'flex', 'important');
       state.codeView.style.setProperty('display', 'none', 'important');
       void ensureResolved(state);
@@ -90,7 +92,7 @@ export default defineContentScript({
       const key = routeKey(repoRef);
       const controller = new AbortController();
       const previewId = `gh-html-preview-${routeGeneration}`;
-      const { tab, button } = createPreviewTab(previewId, showPreview);
+      const { tab, button } = createPreviewTab(tabBar, previewId, showPreview);
       tabBar.appendChild(tab);
 
       const container = document.createElement('section');
@@ -98,7 +100,7 @@ export default defineContentScript({
       container.className = PREVIEW_CONTAINER_CLASS;
       container.setAttribute('aria-label', 'Static HTML preview');
       container.style.cssText =
-        'display:none;flex-direction:column;min-height:80vh;border:1px solid var(--borderColor-default,#d1d9e0);border-radius:6px;overflow:hidden;background:var(--bgColor-default,#fff);';
+        'display:none;flex-direction:column;height:calc(100dvh - 96px);min-height:600px;border:1px solid var(--borderColor-default,#d1d9e0);border-radius:6px;overflow:hidden;background:var(--bgColor-default,#fff);';
 
       const header = document.createElement('header');
       header.style.cssText =
@@ -123,7 +125,7 @@ export default defineContentScript({
         'Static preview blocks scripts and external network. Repository assets load on demand.';
 
       const previewArea = document.createElement('div');
-      previewArea.style.cssText = 'flex:1;min-height:400px;';
+      previewArea.style.cssText = 'flex:1;min-height:0;overflow:hidden;';
       const placeholder = document.createElement('p');
       placeholder.style.cssText = 'margin:0;padding:24px;text-align:center;';
       placeholder.textContent = 'Select Preview to render this file safely.';
@@ -131,6 +133,7 @@ export default defineContentScript({
       container.append(header, details, previewArea);
       blob.appendChild(container);
 
+      const nativeListenerCleanup: Array<() => void> = [];
       state = {
         generation: routeGeneration,
         key,
@@ -140,6 +143,8 @@ export default defineContentScript({
         controller,
         tab,
         tabButton: button,
+        tabBar,
+        nativeListenerCleanup,
         container,
         previewArea,
         status,
@@ -154,7 +159,11 @@ export default defineContentScript({
         tabBar.querySelectorAll<HTMLButtonElement>('button'),
       )) {
         if (nativeButton === button) continue;
-        ctx.addEventListener(nativeButton, 'click', showCode);
+        const listener = () => showCode(nativeButton);
+        nativeButton.addEventListener('click', listener);
+        nativeListenerCleanup.push(() =>
+          nativeButton.removeEventListener('click', listener),
+        );
       }
     };
 
@@ -176,17 +185,19 @@ export default defineContentScript({
       const blob = findBlobContainer();
       if (!tabBar || !blob) return;
 
+      const remainPreviewActive = state?.active ?? false;
       if (
         state &&
         (state.key !== key ||
           !state.container.isConnected ||
-          (!state.sourceHtml && pageData.html))
+          (pageData.html !== null && pageData.html !== state.sourceHtml))
       ) {
         teardown();
       }
 
       if (!state) {
         mount({ ...pageData, repoRef }, tabBar, blob);
+        if (remainPreviewActive) showPreview();
         return;
       }
 
@@ -209,6 +220,11 @@ export default defineContentScript({
     };
 
     const observer = new MutationObserver((mutations) => {
+      if (location.href !== lastLocation) {
+        lastLocation = location.href;
+        scheduleReconcile();
+        return;
+      }
       const disconnected = state !== null && !state.container.isConnected;
       const relevant = mutations.some((mutation) =>
         Array.from(mutation.addedNodes).some(
@@ -223,7 +239,7 @@ export default defineContentScript({
     observer.observe(document.body, { childList: true, subtree: true });
 
     ctx.addEventListener(window, 'wxt:locationchange', () => {
-      teardown();
+      lastLocation = location.href;
       scheduleReconcile();
     });
 
@@ -322,20 +338,40 @@ function findCodeView(blobContainer: HTMLElement): HTMLElement | null {
 }
 
 function createPreviewTab(
+  tabBar: HTMLElement,
   previewId: string,
   onClick: () => void,
 ): { tab: HTMLLIElement; button: HTMLButtonElement } {
-  const tab = document.createElement('li');
+  const template = tabBar.querySelector<HTMLLIElement>('li:last-child');
+  const tab = template
+    ? (template.cloneNode(true) as HTMLLIElement)
+    : document.createElement('li');
   tab.className = PREVIEW_TAB_CLASS;
+  if (template) tab.className = `${template.className} ${PREVIEW_TAB_CLASS}`;
   tab.setAttribute('role', 'presentation');
-  const button = document.createElement('button');
+  tab.removeAttribute('data-selected');
+  const button =
+    tab.querySelector<HTMLButtonElement>('button') ??
+    document.createElement('button');
+  if (!button.parentElement) tab.appendChild(button);
   button.type = 'button';
   button.setAttribute('role', 'tab');
   button.setAttribute('aria-controls', previewId);
   button.setAttribute('aria-selected', 'false');
-  button.textContent = 'Preview';
-  button.style.cssText =
-    'min-height:32px;padding:5px 12px;border:1px solid var(--borderColor-default,#d1d9e0);border-radius:0 6px 6px 0;background:var(--bgColor-default,#fff);color:var(--fgColor-default,#1f2328);font:inherit;cursor:pointer;';
+  button.setAttribute('aria-current', 'false');
+  button.style.setProperty(
+    '--separator-color',
+    'var(--borderColor-default)',
+  );
+  const text =
+    button.querySelector<HTMLElement>('[data-text]') ??
+    button.querySelector<HTMLElement>('.segmentedControl-text');
+  if (text) {
+    text.textContent = 'Preview';
+    text.setAttribute('data-text', 'Preview');
+  } else {
+    button.textContent = 'Preview';
+  }
   button.addEventListener('click', (event) => {
     event.preventDefault();
     event.stopPropagation();
@@ -343,6 +379,28 @@ function createPreviewTab(
   });
   tab.appendChild(button);
   return { tab, button };
+}
+
+function setSelectedTab(
+  tabBar: HTMLElement,
+  selectedButton: HTMLButtonElement | null,
+): void {
+  for (const button of Array.from(
+    tabBar.querySelectorAll<HTMLButtonElement>('button'),
+  )) {
+    const selected = button === selectedButton;
+    button.setAttribute('aria-current', String(selected));
+    if (button.closest('li')?.classList.contains(PREVIEW_TAB_CLASS)) {
+      button.setAttribute('aria-selected', String(selected));
+    }
+    button.style.setProperty(
+      '--separator-color',
+      selected ? 'transparent' : 'var(--borderColor-default)',
+    );
+    const item = button.closest('li');
+    if (selected) item?.setAttribute('data-selected', '');
+    else item?.removeAttribute('data-selected');
+  }
 }
 
 function buildPreviewPageUrl(repoRef: Readonly<RepoRef>): string {

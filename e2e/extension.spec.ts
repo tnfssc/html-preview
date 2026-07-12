@@ -105,12 +105,22 @@ test('static blob preview is useful, inert, and network-contained', async () => 
 
     const previewButton = page.getByRole('tab', { name: 'Preview' });
     await expect(previewButton).toBeVisible();
+    const blameButton = page.getByRole('button', { name: 'Blame' });
+    expect(await previewButton.getAttribute('class')).toBe(
+      await blameButton.getAttribute('class'),
+    );
+    const previewBox = await previewButton.boundingBox();
+    const blameBox = await blameButton.boundingBox();
+    expect(Math.abs((previewBox?.y ?? 0) - (blameBox?.y ?? 0))).toBeLessThanOrEqual(1);
+    expect(Math.abs((previewBox?.height ?? 0) - (blameBox?.height ?? 0))).toBeLessThanOrEqual(1);
     await previewButton.click();
 
     const container = page.locator('.gh-html-preview-container');
     await expect(container.getByRole('status')).toHaveText('Partial');
     const iframe = container.locator('iframe[title="Static HTML preview"]');
     await expect(iframe).toBeVisible();
+    expect((await container.boundingBox())?.height).toBeGreaterThanOrEqual(600);
+    expect((await iframe.boundingBox())?.height).toBeGreaterThanOrEqual(500);
     const frame = iframe.contentFrame();
     await expect(frame.locator('#script-result')).toHaveText('Waiting for script');
     await expect(frame.locator('script, iframe, object, embed')).toHaveCount(0);
@@ -267,19 +277,20 @@ test('SPA navigation cancels stale resource work and renders only new file', asy
     );
 
     await page.evaluate(
-      ({ url, payload }) => {
+      ({ url, html }) => {
         history.pushState({}, '', url);
-        const embedded = document.querySelector<HTMLScriptElement>(
-          'script[data-target="react-app.embeddedData"]',
-        );
-        if (embedded) embedded.textContent = payload;
         const source = document.querySelector('.react-code-lines');
-        if (source) source.textContent = 'File B source';
+        if (source) {
+          const textarea = document.createElement('textarea');
+          textarea.setAttribute('aria-label', 'file content');
+          textarea.value = html;
+          source.replaceChildren(textarea);
+        }
         window.dispatchEvent(new Event('wxt:locationchange'));
       },
       {
         url: nextUrl,
-        payload: githubEmbeddedPayload(nextHtml, commit, nextPath),
+        html: nextHtml,
       },
     );
 
@@ -380,12 +391,24 @@ test('inline preview falls back to public raw source when embedded HTML is absen
 
 function githubBlobFixture(html: string, oid: string, filePath: string): string {
   const payload = githubEmbeddedPayload(html, oid, filePath);
-  return `<!doctype html><html><body>
+  return `<!doctype html><html><head><style>
+    ul.SegmentedControl { display: flex; margin: 0; padding: 0; list-style: none; }
+    .native-segment { display: block; }
+    .native-segment-button { height: 32px; padding: 5px 12px; }
+  </style></head><body>
     <main id="blob">
       <div class="react-blob-view-header-sticky">
         <ul class="SegmentedControl" aria-label="File view">
-          <li><button type="button" aria-selected="true">Code</button></li>
-          <li><button type="button" aria-selected="false">Blame</button></li>
+          <li class="native-segment" data-selected data-component="SegmentedControl.Button">
+            <button class="native-segment-button" type="button" aria-current="true" style="--separator-color:transparent">
+              <span class="segmentedControl-content"><span class="segmentedControl-text" data-text="Code">Code</span></span>
+            </button>
+          </li>
+          <li class="native-segment" data-component="SegmentedControl.Button">
+            <button class="native-segment-button" type="button" aria-current="false" style="--separator-color:var(--borderColor-default)">
+              <span class="segmentedControl-content"><span class="segmentedControl-text" data-text="Blame">Blame</span></span>
+            </button>
+          </li>
         </ul>
       </div>
       <div id="source"><div class="react-code-lines">Source code</div></div>

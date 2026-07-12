@@ -29,7 +29,7 @@ export function renderStaticPreview(
     : result.html;
   iframe.title = options?.title ?? 'Static HTML preview';
   iframe.referrerPolicy = 'no-referrer';
-  iframe.setAttribute('sandbox', channel ? 'allow-scripts' : '');
+  iframe.setAttribute('sandbox', 'allow-scripts');
   iframe.style.width = '100%';
   iframe.style.height = options?.height ?? '100%';
   iframe.style.display = 'block';

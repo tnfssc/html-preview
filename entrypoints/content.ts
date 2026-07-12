@@ -327,7 +327,7 @@ async function ensureResolved(route: RouteState): Promise<void> {
           })
         ).text;
       const result = await resolveHtml(sourceHtml, {
-        target: 'static',
+        target: route.isPrivate ? 'sandbox-private' : 'sandbox',
         repoRef: route.repoRef,
         githubToken,
         privateRepo: route.isPrivate,

@@ -792,11 +792,12 @@ async function renderComparisonSide(
       token: githubToken,
       privateRepo: side.privateRepo,
     });
+    const privateRepo = side.privateRepo || file.authenticated;
     const result = await resolveHtml(file.text, {
-      target: 'static',
+      target: privateRepo ? 'sandbox-private' : 'sandbox',
       repoRef,
       githubToken,
-      privateRepo: side.privateRepo || file.authenticated,
+      privateRepo,
       signal,
     });
     signal.throwIfAborted();

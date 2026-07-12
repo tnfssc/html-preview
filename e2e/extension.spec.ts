@@ -115,7 +115,7 @@ async function routeProductFixtures(
   return requested;
 }
 
-test('static blob preview is useful, inert, and network-contained', async () => {
+test('blob preview executes repository scripts inside sandbox', async () => {
   const { context, page } = await launchWithExtension();
   try {
     const requested = await routeProductFixtures(context);
@@ -134,21 +134,31 @@ test('static blob preview is useful, inert, and network-contained', async () => 
     await previewButton.click();
 
     const container = page.locator('.gh-html-preview-container');
-    await expect(container.getByRole('status')).toHaveText('Partial');
+    await expect(container.getByRole('status')).toHaveText('Ready');
     const iframe = container.locator('iframe[title="Static HTML preview"]');
     await expect(iframe).toBeVisible();
     expect((await container.boundingBox())?.height).toBeGreaterThanOrEqual(600);
     expect((await iframe.boundingBox())?.height).toBeGreaterThanOrEqual(500);
     const frame = iframe.contentFrame();
-    await expect(frame.locator('#script-result')).toHaveText('Waiting for script');
-    await expect(frame.locator('script, iframe, object, embed')).toHaveCount(0);
-    await expect(frame.locator('#chart')).toHaveAttribute('src', /^data:image\/png;base64,/);
-    await expect(frame.locator('meta[http-equiv="Content-Security-Policy" i]')).toHaveAttribute(
-      'content',
-      /default-src 'none'/,
+    await expect
+      .poll(() =>
+        frame
+          .locator('body')
+          .evaluate(
+            () =>
+              (globalThis as typeof globalThis & { inlineRan?: boolean })
+                .inlineRan,
+          ),
+      )
+      .toBe(true);
+    await expect(frame.locator('script[src]')).toHaveCount(1);
+    await expect(frame.locator('#chart')).toHaveAttribute(
+      'src',
+      /^https:\/\/cdn\.jsdelivr\.net\//,
     );
-    expect(requested.some((url) => url.startsWith('https://tracker.example/'))).toBe(false);
-
+    await expect(
+      frame.locator('meta[http-equiv="Content-Security-Policy" i]'),
+    ).toHaveCount(0);
     await page.getByRole('button', { name: 'Code' }).click();
     await expect(container).toBeHidden();
     await expect(page.locator('.react-code-lines')).toBeVisible();
@@ -287,7 +297,7 @@ test('fork PR gets one preview link for exact head repository and commit', async
       await richFrame
         .locator('body')
         .evaluate(() => Reflect.has(globalThis, 'unsafe')),
-    ).toBe(false);
+    ).toBe(true);
     await expect(htmlDiff.locator('.js-file-content')).toBeHidden();
     await sourceButton.click();
     await expect(htmlDiff.locator('.js-file-content')).toBeVisible();
@@ -366,7 +376,7 @@ test('authenticated changes DOM receives HTML source and rich diff controls', as
         await route.fulfill({
           status: 200,
           contentType: 'text/html',
-          body: '<!doctype html><html><body style="margin:0;width:1600px;height:3000px"><h1 id="before-rich">Before version</h1><div style="margin-top:2800px">Before end</div></body></html>',
+          body: '<!doctype html><html><body style="margin:0;width:1600px;height:3000px"><h1 id="before-rich">Before version</h1><output id="before-script"></output><script>document.querySelector("#before-script").textContent = "Before script ran"</script><div style="margin-top:2800px">Before end</div></body></html>',
         });
         return;
       }
@@ -378,7 +388,7 @@ test('authenticated changes DOM receives HTML source and rich diff controls', as
         await route.fulfill({
           status: 200,
           contentType: 'text/html',
-          body: '<!doctype html><html><body style="margin:0;width:1600px;height:3000px"><h1 id="react-rich">After version</h1><div style="margin-top:2800px">After end</div></body></html>',
+          body: '<!doctype html><html><body style="margin:0;width:1600px;height:3000px"><h1 id="react-rich">After version</h1><output id="after-script"></output><script>document.querySelector("#after-script").textContent = "After script ran"</script><div style="margin-top:2800px">After end</div></body></html>',
         });
         return;
       }
@@ -413,6 +423,12 @@ test('authenticated changes DOM receives HTML source and rich diff controls', as
       'Before version',
     );
     await expect(afterFrame.locator('#react-rich')).toHaveText('After version');
+    await expect(beforeFrame.locator('#before-script')).toHaveText(
+      'Before script ran',
+    );
+    await expect(afterFrame.locator('#after-script')).toHaveText(
+      'After script ran',
+    );
     const beforeHandle = await beforeIframe.elementHandle();
     const afterHandle = await afterIframe.elementHandle();
     const beforePageFrame = await beforeHandle?.contentFrame();

@@ -512,6 +512,24 @@ test('private blob and executable preview use local token without exposing it', 
 
     const popup = await context.newPage();
     await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+    const tokenCreationLink = popup.getByRole('link', {
+      name: 'Create fine-grained token',
+    });
+    await expect(tokenCreationLink).toHaveAttribute('target', '_blank');
+    const tokenCreationUrl = new URL(
+      (await tokenCreationLink.getAttribute('href')) ?? '',
+    );
+    expect(tokenCreationUrl.origin + tokenCreationUrl.pathname).toBe(
+      'https://github.com/settings/personal-access-tokens/new',
+    );
+    expect(Object.fromEntries(tokenCreationUrl.searchParams)).toEqual({
+      name: 'GitHub HTML Preview',
+      description:
+        'Read-only private repository access for GitHub HTML Preview',
+      contents: 'read',
+      metadata: 'read',
+      pull_requests: 'read',
+    });
     await popup.getByLabel('Private repository access').fill(privateToken);
     await popup.getByRole('button', { name: 'Save token' }).click();
     await expect(popup.getByRole('status')).toContainText(

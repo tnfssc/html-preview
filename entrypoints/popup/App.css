@@ -113,6 +113,19 @@ body {
   background: var(--gh-bg-default);
 }
 
+.token-link {
+  display: inline-block;
+  margin-top: 8px;
+  color: var(--gh-fg-accent);
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.token-link:hover {
+  text-decoration: underline;
+}
+
 .button-row {
   display: flex;
   gap: 8px;

@@ -9,6 +9,17 @@ import { debugError, debugLog } from '@/utils/debug';
 
 type SaveState = 'idle' | 'saving' | 'saved' | 'error';
 
+const TOKEN_CREATION_URL = `https://github.com/settings/personal-access-tokens/new?${new URLSearchParams(
+  {
+    name: 'GitHub HTML Preview',
+    description:
+      'Read-only private repository access for GitHub HTML Preview',
+    contents: 'read',
+    metadata: 'read',
+    pull_requests: 'read',
+  },
+).toString()}`;
+
 export default function App(): React.JSX.Element {
   const [enabled, setEnabled] = useState(true);
   const [token, setToken] = useState('');
@@ -157,6 +168,14 @@ export default function App(): React.JSX.Element {
           requests access for selected repositories. Token stays in local
           extension storage.
         </p>
+        <a
+          className="token-link"
+          href={TOKEN_CREATION_URL}
+          target="_blank"
+          rel="noreferrer"
+        >
+          Create fine-grained token
+        </a>
         <input
           id="github-token"
           type="password"

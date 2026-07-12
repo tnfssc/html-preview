@@ -1,6 +1,7 @@
 import { parsePrFilesUrl, type PrFilesRoute } from '@/utils/github';
-import { enabledStorage } from '@/utils/storage';
+import { enabledStorage, githubTokenStorage } from '@/utils/storage';
 import type { RepoRef } from '@/utils/types';
+import { debugError, debugLog } from '@/utils/debug';
 
 const PREVIEW_LINK_CLASS = 'gh-html-preview-pr-link';
 const DIFF_SELECTOR =
@@ -10,6 +11,7 @@ interface PullHead {
   owner: string;
   repo: string;
   sha: string;
+  privateRepo: boolean;
 }
 
 interface PrRouteState {
@@ -29,6 +31,7 @@ export default defineContentScript({
   runAt: 'document_end',
   main(ctx) {
     let enabled = true;
+    let githubToken: string | null = null;
     let state: PrRouteState | null = null;
     let renderTimer: number | null = null;
 
@@ -59,11 +62,22 @@ export default defineContentScript({
           if (target.header.querySelector(`.${PREVIEW_LINK_CLASS}`)) continue;
           insertPreviewLink(target, head);
         }
+        debugLog('pr', 'buttons-rendered', {
+          owner: head.owner,
+          repo: head.repo,
+          privateRepo: head.privateRepo,
+          targets: targets.length,
+        });
       } catch (error) {
         if (
           !(error instanceof DOMException && error.name === 'AbortError') &&
           !routeState.controller.signal.aborted
         ) {
+          debugError('pr', 'metadata-failed', error, {
+            owner: routeState.route.owner,
+            repo: routeState.route.repo,
+            pull: routeState.route.pullNumber,
+          });
           console.error('[gh-html-preview] PR metadata request failed:', error);
         }
       }
@@ -91,7 +105,7 @@ export default defineContentScript({
           key,
           route: Object.freeze({ ...route }),
           controller,
-          metadata: fetchPullHead(route, controller.signal),
+          metadata: fetchPullHead(route, controller.signal, githubToken),
         };
       }
       scheduleRender();
@@ -115,14 +129,24 @@ export default defineContentScript({
       enabled = next;
       reconcileRoute();
     });
-    void enabledStorage.getValue().then((value) => {
-      enabled = value;
+    const unwatchToken = githubTokenStorage.watch((next) => {
+      githubToken = next;
+      stopRoute();
+      reconcileRoute();
+    });
+    void Promise.all([
+      enabledStorage.getValue(),
+      githubTokenStorage.getValue(),
+    ]).then(([storedEnabled, storedToken]) => {
+      enabled = storedEnabled;
+      githubToken = storedToken;
       reconcileRoute();
     });
 
     ctx.onInvalidated(() => {
       observer.disconnect();
       unwatchEnabled();
+      unwatchToken();
       stopRoute();
     });
   },
@@ -131,16 +155,26 @@ export default defineContentScript({
 async function fetchPullHead(
   route: PrFilesRoute,
   signal: AbortSignal,
+  githubToken: string | null,
 ): Promise<PullHead> {
   const url = `https://api.github.com/repos/${encodeURIComponent(route.owner)}/${encodeURIComponent(route.repo)}/pulls/${route.pullNumber}`;
+  const headers: Record<string, string> = {
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  if (githubToken) headers.Authorization = `Bearer ${githubToken}`;
+  debugLog('pr', 'metadata-fetch', {
+    owner: route.owner,
+    repo: route.repo,
+    pull: route.pullNumber,
+    tokenConfigured: Boolean(githubToken),
+  });
   const response = await fetch(url, {
     signal,
     credentials: 'omit',
+    redirect: 'error',
     referrerPolicy: 'no-referrer',
-    headers: {
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-    },
+    headers,
   });
   if (!response.ok) throw new Error(`GitHub API returned HTTP ${response.status}`);
 
@@ -170,7 +204,12 @@ async function fetchPullHead(
   }
   const match = /^([^/]+)\/([^/]+)$/.exec(fullName);
   if (!match) throw new Error('PR head repository name is malformed.');
-  return { owner: match[1], repo: match[2], sha };
+  return {
+    owner: match[1],
+    repo: match[2],
+    sha,
+    privateRepo: (repoValue as Record<string, unknown>).private === true,
+  };
 }
 
 function findDiffTargets(): DiffTarget[] {
@@ -226,7 +265,7 @@ function insertPreviewLink(target: DiffTarget, head: PullHead): void {
     repo: head.repo,
     ref: head.sha,
     path: target.path,
-  });
+  }, head.privateRepo);
   link.target = '_blank';
   link.rel = 'noreferrer';
   link.style.cssText =
@@ -237,12 +276,13 @@ function insertPreviewLink(target: DiffTarget, head: PullHead): void {
   (actions ?? target.header).appendChild(link);
 }
 
-function buildPreviewPageUrl(repoRef: RepoRef): string {
+function buildPreviewPageUrl(repoRef: RepoRef, privateRepo: boolean): string {
   const params = new URLSearchParams({
     owner: repoRef.owner,
     repo: repoRef.repo,
     ref: repoRef.ref,
     path: repoRef.path,
+    ...(privateRepo ? { private: '1' } : {}),
   });
   return browser.runtime.getURL(`/preview.html?${params.toString()}`);
 }

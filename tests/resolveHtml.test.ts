@@ -166,7 +166,7 @@ describe('static preview', () => {
       expect.objectContaining({
         level: 'error',
         code: 'resource-fetch-failed',
-        message: 'resource exceeds 4 byte limit',
+        message: 'Repository resource exceeds 4 byte limit.',
         url: 'large.png',
       }),
     ]);
@@ -221,5 +221,103 @@ describe('sandbox preview', () => {
     expect(css).toContain(
       `url("${cdnRoot}reports/weekly/hero.png")`,
     );
+  });
+
+  it('packages private CSS, images, classic scripts, and module graphs without exposing token', async () => {
+    const apiPrefix =
+      'https://api.github.com/repos/acme/reports/contents/';
+    const resources: Record<string, { body: string; type: string }> = {
+      [`${apiPrefix}assets/private.css?ref=${repoRef.ref}`]: {
+        body: '.hero { background: url(\"./background.png\") }',
+        type: 'text/plain',
+      },
+      [`${apiPrefix}assets/background.png?ref=${repoRef.ref}`]: {
+        body: 'background',
+        type: 'application/octet-stream',
+      },
+      [`${apiPrefix}reports/weekly/chart.png?ref=${repoRef.ref}`]: {
+        body: 'chart',
+        type: 'application/octet-stream',
+      },
+      [`${apiPrefix}reports/weekly/classic.js?ref=${repoRef.ref}`]: {
+        body: 'globalThis.classicLoaded = true;',
+        type: 'application/octet-stream',
+      },
+      [`${apiPrefix}reports/weekly/main.js?ref=${repoRef.ref}`]: {
+        body: 'import { value } from \"./dependency.js\"; globalThis.moduleValue = value;',
+        type: 'application/octet-stream',
+      },
+      [`${apiPrefix}reports/weekly/dependency.js?ref=${repoRef.ref}`]: {
+        body: 'export const value = 42;',
+        type: 'application/octet-stream',
+      },
+    };
+    const requests: Array<{ url: string; authorization: string | null }> = [];
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const headers = new Headers(init?.headers);
+      requests.push({
+        url,
+        authorization: headers.get('Authorization'),
+      });
+      const resource = resources[url];
+      return resource
+        ? new Response(resource.body, {
+            status: 200,
+            headers: { 'content-type': resource.type },
+          })
+        : new Response('missing', { status: 404 });
+    }) as typeof fetch;
+
+    const result = await resolveHtml(
+      `<!doctype html><html><head>
+        <link rel=\"stylesheet\" href=\"/assets/private.css\">
+      </head><body>
+        <img id=\"chart\" src=\"./chart.png\">
+        <script id=\"classic\" src=\"./classic.js\"></script>
+        <script id=\"module\" type=\"module\" src=\"./main.js\"></script>
+      </body></html>`,
+      {
+        target: 'sandbox-private',
+        repoRef,
+        githubToken: 'secret-token',
+        privateRepo: true,
+      },
+    );
+
+    const doc = new DOMParser().parseFromString(result.html, 'text/html');
+    expect(doc.querySelector('style')?.textContent).toContain(
+      'data:image/png;base64,',
+    );
+    expect(doc.querySelector('#chart')?.getAttribute('src')).toMatch(
+      /^data:image\/png;base64,/,
+    );
+    expect(doc.querySelector('#classic')?.getAttribute('src')).toMatch(
+      /^data:application\/javascript;base64,/,
+    );
+    expect(doc.querySelector('#module')?.getAttribute('src')).toMatch(
+      /^data:application\/javascript;base64,/,
+    );
+    const encodedModule =
+      doc.querySelector('#module')?.getAttribute('src')?.split(',')[1] ?? '';
+    const moduleSource = atob(encodedModule);
+    expect(moduleSource).not.toContain('./dependency.js');
+    expect(moduleSource).toContain(
+      'https://private-preview.invalid/reports/weekly/dependency.js',
+    );
+    const importMap =
+      doc.querySelector('script[type="importmap"]')?.textContent ?? '';
+    expect(importMap).toContain('https://private-preview.invalid/reports/weekly/dependency.js');
+    expect(importMap).toContain('data:application/javascript;base64,');
+    expect(result.html).not.toContain('secret-token');
+    expect(result.html).not.toContain('api.github.com');
+    expect(requests).toHaveLength(6);
+    expect(
+      requests.every(
+        ({ url, authorization }) =>
+          url.startsWith(apiPrefix) && authorization === 'Bearer secret-token',
+      ),
+    ).toBe(true);
+    expect(result.resources.failed).toBe(0);
   });
 });

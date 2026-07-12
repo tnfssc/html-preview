@@ -2,6 +2,7 @@ import {
   SANDBOX_READY,
   isSandboxRenderMessage,
 } from '@/utils/sandboxProtocol';
+import { debugLog } from '@/utils/debug';
 
 const parameters = new URLSearchParams(location.hash.slice(1));
 const channel = parameters.get('channel');
@@ -13,6 +14,7 @@ if (!channel) {
   const announce = () => {
     attempts += 1;
     parent.postMessage({ kind: SANDBOX_READY, channel }, '*');
+    if (attempts === 1) debugLog('sandbox', 'ready-announced');
     if (attempts >= 40) window.clearInterval(announceTimer);
   };
   const announceTimer = window.setInterval(announce, 250);
@@ -28,6 +30,9 @@ if (!channel) {
     }
     window.removeEventListener('message', receivePreview);
     window.clearInterval(announceTimer);
+    debugLog('sandbox', 'render-received', {
+      htmlBytes: event.data.html.length,
+    });
     document.open();
     document.write(event.data.html);
     document.close();

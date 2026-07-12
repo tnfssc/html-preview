@@ -41,10 +41,19 @@ jobs:
       - name: Run deterministic extension E2E
         run: pnpm run test:e2e
 
-      - name: Build release archive
+      - name: Build stable release archive
+        if: ${{ !contains(github.ref_name, '-') }}
         run: pnpm run zip
 
-      - name: Publish GitHub release
+      - name: Build diagnostic prerelease archive
+        if: ${{ contains(github.ref_name, '-debug.') }}
+        run: |
+          pnpm run zip:debug
+          mv .output/github-html-preview-*-chrome.zip \
+            ".output/github-html-preview-${GITHUB_REF_NAME#v}-chrome.zip"
+
+      - name: Publish stable GitHub release
+        if: ${{ !contains(github.ref_name, '-') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
@@ -53,3 +62,16 @@ jobs:
           --verify-tag
           --generate-notes
           --title "GitHub HTML Preview $GITHUB_REF_NAME"
+
+      - name: Publish diagnostic GitHub prerelease
+        if: ${{ contains(github.ref_name, '-debug.') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          .output/*-chrome.zip
+          --verify-tag
+          --prerelease
+          --generate-notes
+          --title "GitHub HTML Preview $GITHUB_REF_NAME"
+          --notes-file .github/release-notes-debug.md

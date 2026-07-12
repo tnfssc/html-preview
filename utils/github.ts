@@ -1,8 +1,10 @@
 import type { RepoRef } from './types';
+import { debugError, debugLog } from './debug';
 
 export interface BlobPageData {
   html: string | null;
   repoRef: RepoRef | null;
+  isPrivate: boolean;
   source: 'code-view' | 'embedded' | 'url-fallback' | 'unavailable';
   diagnostic: string | null;
 }
@@ -14,6 +16,18 @@ export interface PrFilesRoute {
 }
 
 const DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024;
+
+export interface RepositoryBytes {
+  bytes: Uint8Array;
+  contentType: string | null;
+  authenticated: boolean;
+}
+
+export interface RepositoryFetchOptions {
+  token?: string | null;
+  privateRepo?: boolean;
+  maxBytes?: number;
+}
 
 export function parseBlobUrl(url: string | URL): RepoRef | null {
   const parsed = typeof url === 'string' ? new URL(url) : url;
@@ -53,6 +67,7 @@ export function extractBlobPageData(): BlobPageData {
     return {
       html: codeViewSource,
       repoRef: fallback,
+      isPrivate: false,
       source: codeViewSource ? 'code-view' : fallback ? 'url-fallback' : 'unavailable',
       diagnostic: codeViewSource
         ? null
@@ -68,6 +83,8 @@ export function extractBlobPageData(): BlobPageData {
     const payloadRecord = record(payload);
     const fallbackRef = fallback;
     const repo = record(payloadRecord?.repo);
+    const isPrivate =
+      booleanValue(repo?.isPrivate) ?? booleanValue(repo?.private) ?? false;
     const refInfo = record(payloadRecord?.refInfo);
     const styledBlob = record(
       payloadRecord?.['codeViewBlobLayoutRoute.StyledBlob'],
@@ -101,6 +118,7 @@ export function extractBlobPageData(): BlobPageData {
       return {
         html,
         repoRef: { owner, repo: repoName, ref, path },
+        isPrivate,
         source: codeViewSource
           ? 'code-view'
           : usedCanonicalPayload
@@ -115,6 +133,7 @@ export function extractBlobPageData(): BlobPageData {
     return {
       html,
       repoRef: fallback,
+      isPrivate,
       source: fallback ? 'url-fallback' : 'unavailable',
       diagnostic: fallback
         ? 'Canonical repository metadata was incomplete; preview uses route parsing fallback.'
@@ -125,6 +144,7 @@ export function extractBlobPageData(): BlobPageData {
     return {
       html: codeViewSource,
       repoRef: fallback,
+      isPrivate: false,
       source: codeViewSource ? 'code-view' : fallback ? 'url-fallback' : 'unavailable',
       diagnostic: codeViewSource
         ? null
@@ -150,31 +170,133 @@ export function buildJsdelivrUrl(
   return `https://cdn.jsdelivr.net/gh/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}@${encodeURIComponent(repoRef.ref)}/${encodePath(assetPath)}`;
 }
 
-export async function fetchPublicFile(
+export function buildContentsApiUrl(repoRef: RepoRef, path = repoRef.path): string {
+  const apiPath = encodePath(path);
+  const ref = encodeURIComponent(repoRef.ref);
+  return `https://api.github.com/repos/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}/contents/${apiPath}?ref=${ref}`;
+}
+
+export async function fetchRepositoryFile(
   repoRef: RepoRef,
   signal: AbortSignal,
-  maxBytes = DEFAULT_MAX_FILE_BYTES,
-): Promise<string> {
-  const response = await fetch(buildRawUrl(repoRef), {
+  options: RepositoryFetchOptions = {},
+): Promise<{ text: string; authenticated: boolean }> {
+  const resource = await fetchRepositoryBytes(
+    repoRef,
+    repoRef.path,
     signal,
-    credentials: 'omit',
-    referrerPolicy: 'no-referrer',
-  });
-  if (!response.ok) {
-    throw new Error(`Public raw file returned HTTP ${response.status}.`);
+    options,
+  );
+  return {
+    text: new TextDecoder().decode(resource.bytes),
+    authenticated: resource.authenticated,
+  };
+}
+
+export async function fetchRepositoryBytes(
+  repoRef: RepoRef,
+  path: string,
+  signal: AbortSignal,
+  options: RepositoryFetchOptions = {},
+): Promise<RepositoryBytes> {
+  const maxBytes = options.maxBytes ?? DEFAULT_MAX_FILE_BYTES;
+  if (options.privateRepo && !options.token) {
+    throw new Error('Private repository access requires a saved GitHub token.');
   }
 
+  if (!options.privateRepo) {
+    debugLog('github', 'fetch-public', {
+      owner: repoRef.owner,
+      repo: repoRef.repo,
+      path,
+    });
+    const publicResponse = await fetch(buildRawUrl({ ...repoRef, path }), {
+      signal,
+      credentials: 'omit',
+      redirect: 'error',
+      referrerPolicy: 'no-referrer',
+    });
+    if (publicResponse.ok) {
+      const resource = await readRepositoryResponse(
+        publicResponse,
+        maxBytes,
+        signal,
+        false,
+      );
+      debugLog('github', 'fetch-public-complete', {
+        path,
+        status: publicResponse.status,
+        bytes: resource.bytes.byteLength,
+      });
+      return resource;
+    }
+    if (!options.token || ![401, 403, 404].includes(publicResponse.status)) {
+      throw new Error(`Public raw file returned HTTP ${publicResponse.status}.`);
+    }
+  }
+
+  debugLog('github', 'fetch-authenticated', {
+    owner: repoRef.owner,
+    repo: repoRef.repo,
+    path,
+    tokenConfigured: Boolean(options.token),
+  });
+  const response = await fetch(buildContentsApiUrl(repoRef, path), {
+    signal,
+    credentials: 'omit',
+    redirect: 'error',
+    referrerPolicy: 'no-referrer',
+    headers: {
+      Accept: 'application/vnd.github.raw+json',
+      Authorization: `Bearer ${options.token}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+  });
+  if (!response.ok) {
+    const error = new Error(
+      `GitHub private file API returned HTTP ${response.status}.`,
+    );
+    debugError('github', 'fetch-authenticated-failed', error, {
+      path,
+      status: response.status,
+    });
+    throw error;
+  }
+  const resource = await readRepositoryResponse(
+    response,
+    maxBytes,
+    signal,
+    true,
+  );
+  debugLog('github', 'fetch-authenticated-complete', {
+    path,
+    status: response.status,
+    bytes: resource.bytes.byteLength,
+  });
+  return resource;
+}
+
+async function readRepositoryResponse(
+  response: Response,
+  maxBytes: number,
+  signal: AbortSignal,
+  authenticated: boolean,
+): Promise<RepositoryBytes> {
   const declared = Number(response.headers.get('content-length'));
   if (Number.isFinite(declared) && declared > maxBytes) {
     await response.body?.cancel();
-    throw new Error(`HTML exceeds ${maxBytes} byte limit.`);
+    throw new Error(`Repository resource exceeds ${maxBytes} byte limit.`);
   }
   if (!response.body) {
     const bytes = new Uint8Array(await response.arrayBuffer());
     if (bytes.byteLength > maxBytes) {
-      throw new Error(`HTML exceeds ${maxBytes} byte limit.`);
+      throw new Error(`Repository resource exceeds ${maxBytes} byte limit.`);
     }
-    return new TextDecoder().decode(bytes);
+    return {
+      bytes,
+      contentType: response.headers.get('content-type'),
+      authenticated,
+    };
   }
 
   const reader = response.body.getReader();
@@ -188,7 +310,7 @@ export async function fetchPublicFile(
       length += value.byteLength;
       if (length > maxBytes) {
         await reader.cancel();
-        throw new Error(`HTML exceeds ${maxBytes} byte limit.`);
+        throw new Error(`Repository resource exceeds ${maxBytes} byte limit.`);
       }
       chunks.push(value);
     }
@@ -202,7 +324,11 @@ export async function fetchPublicFile(
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return new TextDecoder().decode(bytes);
+  return {
+    bytes,
+    contentType: response.headers.get('content-type'),
+    authenticated,
+  };
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -213,6 +339,10 @@ function record(value: unknown): Record<string, unknown> | null {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function booleanValue(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
 }
 
 function encodePath(path: string): string {

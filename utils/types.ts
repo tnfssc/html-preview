@@ -38,8 +38,10 @@ export interface ResolveLimits {
 }
 
 export interface ResolveOptions {
-  target: 'static' | 'sandbox';
+  target: 'static' | 'sandbox' | 'sandbox-private';
   repoRef: RepoRef;
+  githubToken?: string | null;
+  privateRepo?: boolean;
   signal?: AbortSignal;
   limits?: Partial<ResolveLimits>;
 }

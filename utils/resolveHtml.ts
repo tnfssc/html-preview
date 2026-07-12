@@ -1,4 +1,6 @@
-import { buildJsdelivrUrl, buildRawUrl } from './github';
+import { buildJsdelivrUrl, fetchRepositoryBytes } from './github';
+import { parse } from 'es-module-lexer/js';
+import { debugError, debugLog } from './debug';
 import type {
   RepoRef,
   ResolveDiagnostic,
@@ -21,8 +23,13 @@ const MEDIA_TYPES: Record<string, string> = {
   css: 'text/css',
   gif: 'image/gif',
   ico: 'image/x-icon',
+  htm: 'text/html',
+  html: 'text/html',
+  js: 'application/javascript',
   jpeg: 'image/jpeg',
   jpg: 'image/jpeg',
+  json: 'application/json',
+  mjs: 'application/javascript',
   mp3: 'audio/mpeg',
   mp4: 'video/mp4',
   oga: 'audio/ogg',
@@ -32,6 +39,7 @@ const MEDIA_TYPES: Record<string, string> = {
   png: 'image/png',
   svg: 'image/svg+xml',
   ttf: 'font/ttf',
+  vtt: 'text/vtt',
   wav: 'audio/wav',
   webm: 'video/webm',
   webp: 'image/webp',
@@ -84,7 +92,9 @@ class ResourceLoader {
   constructor(
     readonly repoRef: RepoRef,
     readonly limits: ResolveLimits,
-    readonly signal: AbortSignal | undefined,
+    readonly signal: AbortSignal,
+    readonly githubToken: string | null,
+    readonly privateRepo: boolean,
   ) {}
 
   addDiagnostic(
@@ -97,44 +107,30 @@ class ResourceLoader {
   }
 
   async load(path: string, search = ''): Promise<ResourceData> {
-    const url = `${buildRawUrl({ ...this.repoRef, path })}${search}`;
+    const url = `${path}${search}`;
     const cached = this.cache.get(url);
     if (cached) return cached;
 
     const request = this.withSlot(async () => {
-      this.signal?.throwIfAborted();
-      const response = await fetch(url, {
-        signal: this.signal,
-        credentials: 'omit',
-        referrerPolicy: 'no-referrer',
-      });
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      const declaredLength = Number(response.headers.get('content-length'));
-      if (
-        Number.isFinite(declaredLength) &&
-        declaredLength > this.limits.maxResourceBytes
-      ) {
-        await response.body?.cancel();
-        throw new Error(
-          `resource exceeds ${this.limits.maxResourceBytes} byte limit`,
-        );
-      }
-
-      const bytes = await readBoundedBody(
-        response,
-        this.limits.maxResourceBytes,
+      this.signal.throwIfAborted();
+      const resource = await fetchRepositoryBytes(
+        this.repoRef,
+        path,
         this.signal,
+        {
+          token: this.githubToken,
+          privateRepo: this.privateRepo,
+          maxBytes: this.limits.maxResourceBytes,
+        },
       );
+      const bytes = resource.bytes;
       if (this.stats.bytes + bytes.byteLength > this.limits.maxTotalBytes) {
         throw new Error(`total resources exceed ${this.limits.maxTotalBytes} byte limit`);
       }
 
       this.stats.fetched += 1;
       this.stats.bytes += bytes.byteLength;
-      const headerMime = response.headers.get('content-type')?.split(';')[0].trim();
+      const headerMime = resource.contentType?.split(';')[0].trim();
       return {
         bytes,
         mime: headerMime || mimeTypeFromPath(path),
@@ -151,7 +147,7 @@ class ResourceLoader {
       this.waiters.push(resolve);
       await promise;
     }
-    this.signal?.throwIfAborted();
+    this.signal.throwIfAborted();
     this.active += 1;
     try {
       return await operation();
@@ -168,22 +164,50 @@ export async function resolveHtml(
 ): Promise<ResolveResult> {
   options.signal?.throwIfAborted();
   const limits = validateLimits({ ...DEFAULT_LIMITS, ...options.limits });
-  const loader = new ResourceLoader(options.repoRef, limits, options.signal);
+  const signal = options.signal ?? new AbortController().signal;
+  const loader = new ResourceLoader(
+    options.repoRef,
+    limits,
+    signal,
+    options.githubToken ?? null,
+    options.privateRepo ?? options.target === 'sandbox-private',
+  );
+  debugLog('resolver', 'start', {
+    target: options.target,
+    path: options.repoRef.path,
+    privateRepo: loader.privateRepo,
+    tokenConfigured: Boolean(loader.githubToken),
+    htmlBytes: new TextEncoder().encode(html).byteLength,
+  });
   const doc = new DOMParser().parseFromString(html, 'text/html');
   const sourcePath = resolveBasePath(doc, options.repoRef, loader);
 
   if (options.target === 'static') {
     await resolveStaticDocument(doc, sourcePath, loader);
-  } else {
+  } else if (options.target === 'sandbox') {
     await resolveSandboxDocument(doc, sourcePath, loader);
+  } else {
+    await resolvePrivateSandboxDocument(doc, sourcePath, loader);
   }
 
   options.signal?.throwIfAborted();
-  return {
+  const result = {
     html: `<!doctype html>\n${doc.documentElement.outerHTML}`,
     diagnostics: loader.diagnostics,
     resources: { ...loader.stats },
   };
+  debugLog('resolver', 'complete', {
+    target: options.target,
+    path: options.repoRef.path,
+    fetched: result.resources.fetched,
+    inlined: result.resources.inlined,
+    rewritten: result.resources.rewritten,
+    skipped: result.resources.skipped,
+    failed: result.resources.failed,
+    bytes: result.resources.bytes,
+    diagnostics: result.diagnostics.length,
+  });
+  return result;
 }
 
 export function resolveRepositoryUrl(
@@ -469,6 +493,342 @@ async function resolveSandboxDocument(
       }
     }),
   );
+}
+
+async function resolvePrivateSandboxDocument(
+  doc: Document,
+  sourcePath: string,
+  loader: ResourceLoader,
+): Promise<void> {
+  if (!loader.githubToken) {
+    throw new Error('Private repository access requires a saved GitHub token.');
+  }
+  doc.querySelector('base')?.remove();
+
+  const stylesheetLinks = Array.from(
+    doc.querySelectorAll<HTMLLinkElement>('link[rel~="stylesheet"][href]'),
+  );
+  await Promise.all(
+    stylesheetLinks.map(async (link) => {
+      const href = link.getAttribute('href');
+      if (!href) return;
+      const resolved = resolveRepositoryUrl(href, loader.repoRef, sourcePath);
+      if (resolved.kind !== 'repo' || !resolved.path) return;
+      try {
+        const resource = await loader.load(resolved.path, resolved.search);
+        const css = await inlinePrivateCss(
+          new TextDecoder().decode(resource.bytes),
+          resolved.path,
+          1,
+          loader,
+        );
+        const style = doc.createElement('style');
+        style.textContent = css;
+        link.replaceWith(style);
+        loader.stats.inlined += 1;
+      } catch (error) {
+        link.remove();
+        recordResourceFailure(loader, href, error);
+      }
+    }),
+  );
+
+  for (const style of Array.from(doc.querySelectorAll('style'))) {
+    style.textContent = await inlinePrivateCss(
+      style.textContent ?? '',
+      sourcePath,
+      0,
+      loader,
+    );
+  }
+  await Promise.all(
+    Array.from(doc.querySelectorAll<HTMLElement>('[style]')).map(
+      async (element) => {
+        const css = element.getAttribute('style');
+        if (css !== null) {
+          element.setAttribute(
+            'style',
+            await rewritePrivateCssUrls(css, sourcePath, loader),
+          );
+        }
+      },
+    ),
+  );
+
+  const attributeJobs: Array<Promise<void>> = [];
+  const queueAttribute = (selector: string, attribute: string) => {
+    for (const element of Array.from(doc.querySelectorAll(selector))) {
+      attributeJobs.push(
+        inlinePrivateAttribute(element, attribute, sourcePath, loader),
+      );
+    }
+  };
+  queueAttribute('img[src], input[type="image"][src]', 'src');
+  queueAttribute('video[poster]', 'poster');
+  queueAttribute('video[src], audio[src], source[src]', 'src');
+  queueAttribute('track[src]', 'src');
+  queueAttribute('[background]', 'background');
+  queueAttribute('link[href]:not([rel~="stylesheet"])', 'href');
+  queueAttribute('iframe[src], embed[src]', 'src');
+  queueAttribute('object[data]', 'data');
+  await Promise.all(attributeJobs);
+
+  await Promise.all(
+    Array.from(doc.querySelectorAll('img[srcset], source[srcset]')).map(
+      async (element) => {
+        const srcset = element.getAttribute('srcset');
+        if (srcset === null) return;
+        element.setAttribute(
+          'srcset',
+          await transformSrcset(srcset, async (url) =>
+            privateResourceValue(url, sourcePath, loader),
+          ),
+        );
+      },
+    ),
+  );
+
+  const moduleMap: Record<string, string> = {};
+  for (const script of Array.from(
+    doc.querySelectorAll<HTMLScriptElement>('script[src]'),
+  )) {
+    const src = script.getAttribute('src');
+    if (!src) continue;
+    const resolved = resolveRepositoryUrl(src, loader.repoRef, sourcePath);
+    if (resolved.kind !== 'repo' || !resolved.path) continue;
+    try {
+      if (script.type === 'module') {
+        const graph = await buildPrivateModuleGraph(resolved.path, loader);
+        Object.assign(moduleMap, graph.imports);
+        script.src = graph.entry;
+      } else {
+        const resource = await loader.load(resolved.path, resolved.search);
+        script.src = resourceDataUrl(
+          resource.bytes,
+          normalizedMime(resource.mime, resolved.path),
+        );
+      }
+      loader.stats.inlined += 1;
+    } catch (error) {
+      script.remove();
+      recordResourceFailure(loader, src, error);
+    }
+  }
+
+  for (const script of Array.from(
+    doc.querySelectorAll<HTMLScriptElement>('script[type="module"]:not([src])'),
+  )) {
+    try {
+      const transformed = await rewriteModuleSource(
+        script.textContent ?? '',
+        sourcePath,
+        loader,
+        moduleMap,
+        new Map<string, string>(),
+      );
+      script.textContent = transformed;
+    } catch (error) {
+      loader.addDiagnostic(
+        'private-inline-module-failed',
+        error instanceof Error ? error.message : 'Inline module rewrite failed.',
+        undefined,
+        'error',
+      );
+    }
+  }
+
+  if (Object.keys(moduleMap).length > 0) {
+    const importMap = doc.createElement('script');
+    importMap.type = 'importmap';
+    importMap.textContent = JSON.stringify({ imports: moduleMap });
+    doc.head.prepend(importMap);
+  }
+}
+
+async function inlinePrivateCss(
+  css: string,
+  sourcePath: string,
+  depth: number,
+  loader: ResourceLoader,
+): Promise<string> {
+  loader.stats.maxDepthReached = Math.max(loader.stats.maxDepthReached, depth);
+  const importPattern =
+    /@import\s+(?:url\(\s*(["']?)(.*?)\1\s*\)|(["'])(.*?)\3)\s*([^;]*);/gi;
+  const imports = await replaceAsync(css, importPattern, async (match) => {
+    const url = match[2] || match[4];
+    const media = match[5]?.trim();
+    const resolved = resolveRepositoryUrl(url, loader.repoRef, sourcePath);
+    if (resolved.kind !== 'repo' || !resolved.path) return match[0];
+    if (depth >= loader.limits.maxDepth) {
+      loader.stats.skipped += 1;
+      loader.addDiagnostic(
+        'css-depth-limit',
+        `CSS import exceeded depth limit ${loader.limits.maxDepth}.`,
+        url,
+      );
+      return '';
+    }
+    try {
+      const resource = await loader.load(resolved.path, resolved.search);
+      const nested = await inlinePrivateCss(
+        new TextDecoder().decode(resource.bytes),
+        resolved.path,
+        depth + 1,
+        loader,
+      );
+      loader.stats.inlined += 1;
+      return media ? `@media ${media} {\n${nested}\n}` : nested;
+    } catch (error) {
+      recordResourceFailure(loader, url, error);
+      return '';
+    }
+  });
+  return rewritePrivateCssUrls(imports, sourcePath, loader);
+}
+
+async function rewritePrivateCssUrls(
+  css: string,
+  sourcePath: string,
+  loader: ResourceLoader,
+): Promise<string> {
+  const urlPattern = /url\(\s*(["']?)(.*?)\1\s*\)/gi;
+  return replaceAsync(css, urlPattern, async (match) => {
+    const url = match[2].trim();
+    if (!url || url.startsWith('#')) return match[0];
+    const value = await privateResourceValue(url, sourcePath, loader);
+    return value ? `url("${value.replaceAll('"', '%22')}")` : 'url("")';
+  });
+}
+
+async function inlinePrivateAttribute(
+  element: Element,
+  attribute: string,
+  sourcePath: string,
+  loader: ResourceLoader,
+): Promise<void> {
+  const value = element.getAttribute(attribute);
+  if (!value) return;
+  const inlined = await privateResourceValue(value, sourcePath, loader);
+  if (inlined) element.setAttribute(attribute, inlined);
+  else element.removeAttribute(attribute);
+}
+
+async function privateResourceValue(
+  value: string,
+  sourcePath: string,
+  loader: ResourceLoader,
+): Promise<string | null> {
+  const resolved = resolveRepositoryUrl(value, loader.repoRef, sourcePath);
+  if (
+    resolved.kind === 'fragment' ||
+    resolved.kind === 'data' ||
+    resolved.kind === 'external'
+  ) {
+    return resolved.value;
+  }
+  if (resolved.kind !== 'repo' || !resolved.path) return null;
+  try {
+    const resource = await loader.load(resolved.path, resolved.search);
+    loader.stats.inlined += 1;
+    return resourceDataUrl(
+      resource.bytes,
+      normalizedMime(resource.mime, resolved.path),
+    );
+  } catch (error) {
+    recordResourceFailure(loader, value, error);
+    return null;
+  }
+}
+
+interface PrivateModuleGraph {
+  entry: string;
+  imports: Record<string, string>;
+}
+
+async function buildPrivateModuleGraph(
+  entryPath: string,
+  loader: ResourceLoader,
+): Promise<PrivateModuleGraph> {
+  const imports: Record<string, string> = {};
+  const modules = new Map<string, string>();
+  await collectPrivateModule(entryPath, loader, imports, modules);
+  return {
+    entry: imports[privateModuleUrl(entryPath)],
+    imports,
+  };
+}
+
+async function collectPrivateModule(
+  path: string,
+  loader: ResourceLoader,
+  imports: Record<string, string>,
+  modules: Map<string, string>,
+): Promise<void> {
+  if (modules.has(path)) return;
+  modules.set(path, '');
+  const resource = await loader.load(path);
+  const source = new TextDecoder().decode(resource.bytes);
+  const transformed = await rewriteModuleSource(
+    source,
+    path,
+    loader,
+    imports,
+    modules,
+  );
+  const dataUrl = resourceDataUrl(
+    new TextEncoder().encode(transformed),
+    'application/javascript',
+  );
+  modules.set(path, dataUrl);
+  imports[privateModuleUrl(path)] = dataUrl;
+  loader.stats.inlined += 1;
+}
+
+async function rewriteModuleSource(
+  source: string,
+  sourcePath: string,
+  loader: ResourceLoader,
+  imports: Record<string, string>,
+  modules: Map<string, string>,
+): Promise<string> {
+  const [records] = parse(source);
+  const replacements: Array<{ start: number; end: number; value: string }> = [];
+  for (const record of records) {
+    if (!record.n) {
+      if (record.d >= 0) {
+        loader.addDiagnostic(
+          'dynamic-module-expression',
+          'Dynamic module expression could not be preloaded for private preview.',
+          sourcePath,
+        );
+      }
+      continue;
+    }
+    const resolved = resolveRepositoryUrl(record.n, loader.repoRef, sourcePath);
+    if (resolved.kind !== 'repo' || !resolved.path) continue;
+    const virtualUrl = privateModuleUrl(resolved.path);
+    replacements.push({ start: record.s, end: record.e, value: virtualUrl });
+    await collectPrivateModule(resolved.path, loader, imports, modules);
+  }
+  let transformed = source;
+  for (const replacement of replacements.sort((a, b) => b.start - a.start)) {
+    transformed =
+      transformed.slice(0, replacement.start) +
+      replacement.value +
+      transformed.slice(replacement.end);
+  }
+  return transformed;
+}
+
+function privateModuleUrl(path: string): string {
+  return `https://private-preview.invalid/${path
+    .split('/')
+    .map(encodeURIComponent)
+    .join('/')}`;
+}
+
+function resourceDataUrl(bytes: Uint8Array, mime: string): string {
+  return `data:${mime};base64,${bytesToBase64(bytes)}`;
 }
 
 async function rewriteSandboxCss(
@@ -870,45 +1230,6 @@ function mimeTypeFromPath(path: string): string {
   return MEDIA_TYPES[extension] ?? 'application/octet-stream';
 }
 
-async function readBoundedBody(
-  response: Response,
-  limit: number,
-  signal: AbortSignal | undefined,
-): Promise<Uint8Array> {
-  if (!response.body) {
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength > limit) throw new Error(`resource exceeds ${limit} byte limit`);
-    return bytes;
-  }
-
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let length = 0;
-  try {
-    while (true) {
-      signal?.throwIfAborted();
-      const { done, value } = await reader.read();
-      if (done) break;
-      length += value.byteLength;
-      if (length > limit) {
-        await reader.cancel();
-        throw new Error(`resource exceeds ${limit} byte limit`);
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-
-  const bytes = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
-}
-
 function bytesToBase64(bytes: Uint8Array): string {
   let binary = '';
   const chunkSize = 0x8000;
@@ -943,6 +1264,7 @@ function recordResourceFailure(
 ): void {
   if (error instanceof DOMException && error.name === 'AbortError') throw error;
   loader.stats.failed += 1;
+  debugError('resolver', 'resource-failed', error, { path: url });
   loader.addDiagnostic(
     'resource-fetch-failed',
     error instanceof Error ? error.message : 'Resource fetch failed.',

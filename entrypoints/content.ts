@@ -1,13 +1,14 @@
 import {
   extractBlobPageData,
-  fetchPublicFile,
+  fetchRepositoryFile,
   parseBlobUrl,
 } from '@/utils/github';
 import { resolveHtml } from '@/utils/resolveHtml';
 import { renderStaticPreview, type RenderResult } from '@/utils/renderer';
-import { enabledStorage } from '@/utils/storage';
+import { enabledStorage, githubTokenStorage } from '@/utils/storage';
 import type { BlobPageData } from '@/utils/github';
 import type { RepoRef, ResolveResult } from '@/utils/types';
+import { debugError, debugLog } from '@/utils/debug';
 
 const PREVIEW_TAB_CLASS = 'gh-html-preview-tab';
 const PREVIEW_CONTAINER_CLASS = 'gh-html-preview-container';
@@ -20,6 +21,7 @@ interface RouteState {
   readonly repoRef: Readonly<RepoRef>;
   readonly sourceHtml: string | null;
   readonly metadataDiagnostic: string | null;
+  readonly isPrivate: boolean;
   readonly controller: AbortController;
   readonly tab: HTMLElement;
   readonly tabButton: HTMLButtonElement;
@@ -46,6 +48,12 @@ export default defineContentScript({
     let lastLocation = location.href;
 
     const teardown = () => {
+      if (state) {
+        debugLog('blob', 'teardown', {
+          path: state.repoRef.path,
+          active: state.active,
+        });
+      }
       generation += 1;
       if (reconcileTimer !== null) {
         window.clearTimeout(reconcileTimer);
@@ -71,6 +79,7 @@ export default defineContentScript({
       setSelectedTab(state.tabBar, selectedButton ?? null);
       state.container.style.setProperty('display', 'none', 'important');
       state.codeView.style.removeProperty('display');
+      debugLog('blob', 'show-code', { path: state.repoRef.path });
     };
 
     const showPreview = () => {
@@ -79,6 +88,10 @@ export default defineContentScript({
       setSelectedTab(state.tabBar, state.tabButton);
       state.container.style.setProperty('display', 'flex', 'important');
       state.codeView.style.setProperty('display', 'none', 'important');
+      debugLog('blob', 'show-preview', {
+        path: state.repoRef.path,
+        privateRepo: state.isPrivate,
+      });
       void ensureResolved(state);
     };
 
@@ -109,7 +122,7 @@ export default defineContentScript({
       status.setAttribute('role', 'status');
       status.textContent = pageData.diagnostic ? 'Partial' : 'Ready';
       const fullLink = document.createElement('a');
-      fullLink.href = buildPreviewPageUrl(repoRef);
+      fullLink.href = buildPreviewPageUrl(repoRef, pageData.isPrivate);
       fullLink.target = '_blank';
       fullLink.rel = 'noreferrer';
       fullLink.textContent = 'Open full preview';
@@ -137,6 +150,7 @@ export default defineContentScript({
         repoRef,
         sourceHtml: pageData.html,
         metadataDiagnostic: pageData.diagnostic,
+        isPrivate: pageData.isPrivate,
         controller,
         tab,
         tabButton: button,
@@ -151,6 +165,14 @@ export default defineContentScript({
         render: null,
         resolving: null,
       };
+      debugLog('blob', 'mounted', {
+        owner: repoRef.owner,
+        repo: repoRef.repo,
+        ref: repoRef.ref.slice(0, 12),
+        path: repoRef.path,
+        source: pageData.source,
+        privateRepo: pageData.isPrivate,
+      });
 
       for (const nativeButton of Array.from(
         tabBar.querySelectorAll<HTMLButtonElement>('button'),
@@ -181,6 +203,11 @@ export default defineContentScript({
       const tabBar = findTabBar();
       const blob = findBlobContainer();
       if (!tabBar || !blob) return;
+      debugLog('blob', 'reconcile', {
+        path: repoRef.path,
+        source: pageData.source,
+        privateRepo: pageData.isPrivate,
+      });
 
       const remainPreviewActive = state?.active ?? false;
       if (
@@ -218,6 +245,10 @@ export default defineContentScript({
 
     const observer = new MutationObserver((mutations) => {
       if (location.href !== lastLocation) {
+        debugLog('blob', 'mutation-location-change', {
+          from: new URL(lastLocation).pathname,
+          to: location.pathname,
+        });
         lastLocation = location.href;
         scheduleReconcile();
         return;
@@ -236,6 +267,7 @@ export default defineContentScript({
     observer.observe(document.body, { childList: true, subtree: true });
 
     ctx.addEventListener(window, 'wxt:locationchange', () => {
+      debugLog('blob', 'wxt-location-change', { path: location.pathname });
       lastLocation = location.href;
       scheduleReconcile();
     });
@@ -244,6 +276,12 @@ export default defineContentScript({
       enabled = next;
       if (!enabled) teardown();
       else scheduleReconcile();
+    });
+    const unwatchToken = githubTokenStorage.watch(() => {
+      const wasActive = state?.active ?? false;
+      teardown();
+      reconcile();
+      if (wasActive) showPreview();
     });
 
     void enabledStorage.getValue().then((value) => {
@@ -254,6 +292,7 @@ export default defineContentScript({
     ctx.onInvalidated(() => {
       observer.disconnect();
       unwatchEnabled();
+      unwatchToken();
       teardown();
     });
   },
@@ -268,19 +307,49 @@ async function ensureResolved(route: RouteState): Promise<void> {
 
   route.resolving = (async () => {
     try {
+      const githubToken = await githubTokenStorage.getValue();
+      debugLog('blob', 'resolve-start', {
+        path: route.repoRef.path,
+        privateRepo: route.isPrivate,
+        tokenConfigured: Boolean(githubToken),
+      });
+      if (route.isPrivate && !githubToken) {
+        throw new Error(
+          'Private repository access requires a fine-grained GitHub token saved in the extension popup.',
+        );
+      }
       const sourceHtml =
         route.sourceHtml ??
-        (await fetchPublicFile(route.repoRef, route.controller.signal));
+        (
+          await fetchRepositoryFile(route.repoRef, route.controller.signal, {
+            token: githubToken,
+            privateRepo: route.isPrivate,
+          })
+        ).text;
       const result = await resolveHtml(sourceHtml, {
         target: 'static',
         repoRef: route.repoRef,
+        githubToken,
+        privateRepo: route.isPrivate,
         signal: route.controller.signal,
       });
       route.controller.signal.throwIfAborted();
       route.render = renderStaticPreview(route.previewArea, result);
       updateResolvedStatus(route, result);
+      debugLog('blob', 'resolve-complete', {
+        path: route.repoRef.path,
+        fetched: result.resources.fetched,
+        inlined: result.resources.inlined,
+        failed: result.resources.failed,
+        skipped: result.resources.skipped,
+        bytes: result.resources.bytes,
+      });
     } catch (error) {
       if (route.controller.signal.aborted) return;
+      debugError('blob', 'resolve-failed', error, {
+        path: route.repoRef.path,
+        privateRepo: route.isPrivate,
+      });
       route.status.textContent = 'Error';
       route.details.style.display = 'block';
       route.details.textContent =
@@ -397,12 +466,16 @@ function setSelectedTab(
   }
 }
 
-function buildPreviewPageUrl(repoRef: Readonly<RepoRef>): string {
+function buildPreviewPageUrl(
+  repoRef: Readonly<RepoRef>,
+  isPrivate: boolean,
+): string {
   const params = new URLSearchParams({
     owner: repoRef.owner,
     repo: repoRef.repo,
     ref: repoRef.ref,
     path: repoRef.path,
+    ...(isPrivate ? { private: '1' } : {}),
   });
   return browser.runtime.getURL(`/preview.html?${params.toString()}`);
 }

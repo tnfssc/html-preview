@@ -43,7 +43,7 @@ body {
 }
 
 .popup {
-  width: 320px;
+  width: 380px;
   padding: 16px;
 }
 
@@ -101,6 +101,51 @@ body {
   font-weight: 600;
   margin-bottom: 6px;
   color: var(--gh-fg-muted);
+}
+
+.token-form input {
+  width: 100%;
+  margin-top: 10px;
+  padding: 7px 9px;
+  border: 1px solid var(--gh-border-default);
+  border-radius: 6px;
+  color: var(--gh-fg-default);
+  background: var(--gh-bg-default);
+}
+
+.button-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.button-row button {
+  padding: 6px 10px;
+  border: 1px solid var(--gh-border-default);
+  border-radius: 6px;
+  color: var(--gh-fg-default);
+  background: var(--gh-bg-default);
+  cursor: pointer;
+}
+
+.button-row button:first-child {
+  color: #fff;
+  border-color: var(--gh-fg-accent);
+  background: var(--gh-fg-accent);
+}
+
+.button-row button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.warning-row {
+  align-items: flex-start;
+  padding: 10px;
+  border: 1px solid var(--gh-warning-fg);
+  border-radius: 6px;
+  background: var(--gh-warning-bg);
+  line-height: 1.4;
 }
 
 .section p {

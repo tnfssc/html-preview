@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      es-module-lexer:
+        specifier: ^2.3.0
+        version: 2.3.0
       react:
         specifier: ^19.2.4
         version: 19.2.7

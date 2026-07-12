@@ -1,11 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
-import { fetchPublicFile } from '@/utils/github';
+import { fetchRepositoryFile } from '@/utils/github';
 import { resolveHtml } from '@/utils/resolveHtml';
+import {
+  githubTokenStorage,
+  privateFullPreviewStorage,
+} from '@/utils/storage';
 import {
   SANDBOX_RENDER,
   isSandboxReadyMessage,
 } from '@/utils/sandboxProtocol';
 import type { RepoRef, ResolveResult } from '@/utils/types';
+import { debugError, debugLog } from '@/utils/debug';
 
 interface LoadState {
   kind: 'loading' | 'ready' | 'partial' | 'error';
@@ -13,7 +18,12 @@ interface LoadState {
   message: string;
 }
 
-function parseRepoRef(): RepoRef | null {
+interface PreviewRequest {
+  repoRef: RepoRef;
+  privateRepo: boolean;
+}
+
+function parseRepoRef(): PreviewRequest | null {
   const params = new URLSearchParams(window.location.search);
   const owner = params.get('owner');
   const repo = params.get('repo');
@@ -29,7 +39,10 @@ function parseRepoRef(): RepoRef | null {
   ) {
     return null;
   }
-  return { owner, repo, ref, path };
+  return {
+    repoRef: { owner, repo, ref, path },
+    privateRepo: params.get('private') === '1',
+  };
 }
 
 function buildGitHubUrl(repoRef: RepoRef): string {
@@ -38,14 +51,14 @@ function buildGitHubUrl(repoRef: RepoRef): string {
 }
 
 export default function App(): React.JSX.Element {
-  const [repoRef] = useState(parseRepoRef);
+  const [request] = useState(parseRepoRef);
   const [state, setState] = useState<LoadState>({
     kind: 'loading',
-    message: 'Fetching public repository file…',
+    message: 'Fetching repository file…',
   });
 
   useEffect(() => {
-    if (!repoRef) {
+    if (!request) {
       setState({
         kind: 'error',
         message: 'Missing or invalid owner, repository, ref, or path.',
@@ -53,14 +66,49 @@ export default function App(): React.JSX.Element {
       return;
     }
     const controller = new AbortController();
+    const { repoRef } = request;
 
     void (async () => {
       try {
-        const html = await fetchPublicFile(repoRef, controller.signal);
+        const [githubToken, privateFullPreview] = await Promise.all([
+          githubTokenStorage.getValue(),
+          privateFullPreviewStorage.getValue(),
+        ]);
+        debugLog('preview', 'load-start', {
+          owner: repoRef.owner,
+          repo: repoRef.repo,
+          ref: repoRef.ref.slice(0, 12),
+          path: repoRef.path,
+          privateRepo: request.privateRepo,
+          tokenConfigured: Boolean(githubToken),
+          privateExecutionEnabled: privateFullPreview,
+        });
+        if (request.privateRepo && !githubToken) {
+          throw new Error(
+            'Save a fine-grained GitHub token in the extension popup to open this private file.',
+          );
+        }
+        if (request.privateRepo && !privateFullPreview) {
+          throw new Error(
+            'Enable executable private previews in the extension popup. Private repository scripts may transmit private content.',
+          );
+        }
+        const file = await fetchRepositoryFile(repoRef, controller.signal, {
+          token: githubToken,
+          privateRepo: request.privateRepo,
+        });
+        const privateRepo = request.privateRepo || file.authenticated;
+        if (privateRepo && !privateFullPreview) {
+          throw new Error(
+            'Enable executable private previews in the extension popup. Private repository scripts may transmit private content.',
+          );
+        }
         setState({ kind: 'loading', message: 'Resolving repository URLs…' });
-        const result = await resolveHtml(html, {
-          target: 'sandbox',
+        const result = await resolveHtml(file.text, {
+          target: privateRepo ? 'sandbox-private' : 'sandbox',
           repoRef,
+          githubToken,
+          privateRepo,
           signal: controller.signal,
         });
         const partial = result.diagnostics.some(
@@ -73,8 +121,19 @@ export default function App(): React.JSX.Element {
             ? 'Preview loaded with resource diagnostics.'
             : 'Executable preview ready.',
         });
+        debugLog('preview', 'load-complete', {
+          path: repoRef.path,
+          privateRepo,
+          fetched: result.resources.fetched,
+          inlined: result.resources.inlined,
+          failed: result.resources.failed,
+        });
       } catch (error) {
         if (controller.signal.aborted) return;
+        debugError('preview', 'load-failed', error, {
+          path: repoRef.path,
+          privateRepo: request.privateRepo,
+        });
         setState({
           kind: 'error',
           message: error instanceof Error ? error.message : 'Preview failed.',
@@ -83,11 +142,12 @@ export default function App(): React.JSX.Element {
     })();
 
     return () => controller.abort();
-  }, [repoRef]);
+  }, [request]);
 
-  if (!repoRef) {
+  if (!request) {
     return <main className="error">Error: {state.message}</main>;
   }
+  const { repoRef } = request;
 
   return (
     <main>
@@ -145,6 +205,7 @@ function SandboxFrame({ html }: { html: string }): React.JSX.Element {
         return;
       }
       completed = true;
+      debugLog('preview', 'sandbox-ready', { htmlBytes: html.length });
       iframe.contentWindow?.postMessage(
         { kind: SANDBOX_RENDER, channel, html },
         '*',
@@ -157,7 +218,11 @@ function SandboxFrame({ html }: { html: string }): React.JSX.Element {
     host.replaceChildren(iframe);
 
     const timeout = window.setTimeout(() => {
-      if (!completed) setHandshakeError('Sandbox did not accept preview content.');
+      if (!completed) {
+        const error = new Error('Sandbox did not accept preview content.');
+        debugError('preview', 'sandbox-timeout', error);
+        setHandshakeError(error.message);
+      }
     }, 10_000);
     return () => {
       window.clearTimeout(timeout);

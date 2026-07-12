@@ -3,10 +3,13 @@ import { defineConfig } from 'wxt';
 // See https://wxt.dev/api/config.html
 export default defineConfig({
   modules: ['@wxt-dev/module-react'],
-  manifest: {
-    name: 'GitHub HTML Preview',
+  manifest: ({ mode }) => ({
+    name:
+      mode === 'debug'
+        ? 'GitHub HTML Preview (Debug)'
+        : 'GitHub HTML Preview',
     description:
-      'Safely preview public HTML files and pull-request changes on GitHub',
+      'Safely preview public and private HTML files and pull-request changes on GitHub',
     permissions: ['storage'],
     host_permissions: [
       '*://github.com/*',
@@ -27,7 +30,7 @@ export default defineConfig({
     content_security_policy: {
       extension_pages: [
         "default-src 'self'",
-        "connect-src https://raw.githubusercontent.com https://cdn.jsdelivr.net",
+        "connect-src https://api.github.com https://raw.githubusercontent.com https://cdn.jsdelivr.net",
         "img-src 'self' data:",
         "object-src 'none'",
         "script-src 'self'",
@@ -49,5 +52,5 @@ export default defineConfig({
     action: {
       default_title: 'GitHub HTML Preview',
     },
-  },
+  }),
 });

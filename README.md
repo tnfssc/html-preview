@@ -1,14 +1,17 @@
 # GitHub HTML Preview
 
-Chrome extension for previewing public `.html` and `.htm` files on GitHub.
+Chrome extension for previewing public and private `.html` and `.htm` files on GitHub.
 
 ## Product behavior
 
 - Blob pages get a **Preview** tab beside GitHub's file controls.
 - Inline previews are static: scripts, forms, embeds, external navigation, and external network requests are blocked. Repository CSS, images, fonts, and media are fetched and embedded locally.
-- **Open full preview** runs public repository HTML and JavaScript in a manifest sandbox with no extension API or parent-page access.
+- **Open full preview** runs repository HTML and JavaScript in a manifest sandbox with no extension API or parent-page access.
 - Pull-request file views get a **Preview** link for changed HTML files. Fork PRs resolve against the fork repository and exact head commit.
-- Current release supports public repositories on Chrome MV3. It does not request GitHub credentials or remove GitHub security headers.
+- Public repositories need no credentials.
+- Private access uses an optional fine-grained GitHub token stored only in `chrome.storage.local`. Give it read-only **Contents** and **Metadata** access for selected repositories.
+- Executable private previews require a separate explicit opt-in because repository scripts can transmit private content to external servers.
+- Tokens are sent only as `Authorization` headers to `https://api.github.com`; they are never placed in URLs, preview HTML, logs, or release artifacts.
 
 ## Development
 
@@ -19,6 +22,8 @@ pnpm test
 pnpm run test:e2e
 pnpm run test:smoke
 pnpm run build
+pnpm run build:debug
+pnpm run zip:debug
 ```
 
 - `pnpm test`: resolver, security, resource-limit, and packaged-manifest contracts.
@@ -27,6 +32,14 @@ pnpm run build
 
 Load `.output/chrome-mv3/` through `chrome://extensions` with Developer mode enabled.
 
+Debug builds output to `.output/chrome-mv3-debug/`. Reproduce problems with GitHub-page and extension-page DevTools open, then filter console output by:
+
+```text
+[gh-html-preview:debug]
+```
+
+Diagnostic logs include lifecycle events, repository paths, HTTP status, resource counts, and failures. They exclude tokens and file contents.
+
 ## Security boundary
 
-Privileged extension pages handle packaged code, settings, and public file fetches. Executable repository content runs only in `sandbox.html`, which cannot access extension APIs or parent DOM. Inline previews carry a deny-by-default document CSP and use only embedded `data:` resources.
+Privileged extension pages handle packaged code, local settings, and authenticated GitHub API requests. Executable repository content runs only in `sandbox.html`, which cannot access extension APIs or parent DOM. Inline previews carry a deny-by-default document CSP and use only embedded `data:` resources. Private CSS, images, scripts, and module graphs are fetched in the privileged context and packaged as data URLs before entering the sandbox.

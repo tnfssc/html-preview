@@ -81,6 +81,27 @@ test('current GitHub PR UI receives HTML preview link', async () => {
     const query = new URL(href ?? '').searchParams;
     expect(query.get('path')).toBe(prHtmlPath);
     expect(query.get('ref')).toMatch(/^[0-9a-f]{40}$/i);
+
+    const htmlDiff = page.locator(`[data-path="${prHtmlPath}"]`).locator('..');
+    const richButton = htmlDiff.getByRole('button', {
+      name: 'Display the rich diff',
+    });
+    await expect(richButton).toBeVisible();
+    await richButton.click();
+    const richContainer = htmlDiff.locator('.gh-html-preview-pr-rich');
+    await expect(richContainer.getByRole('status')).toHaveText(/Ready|Partial/, {
+      timeout: 20_000,
+    });
+    const frame = richContainer
+      .locator(`iframe[title="Rich HTML diff for ${prHtmlPath}"]`)
+      .contentFrame();
+    await expect(
+      frame.getByRole('heading', { name: 'Number guessing game' }),
+    ).toBeVisible();
+    await htmlDiff
+      .getByRole('button', { name: 'Display the source diff' })
+      .click();
+    await expect(htmlDiff.locator('.js-file-content')).toBeVisible();
   } finally {
     await context.close();
   }

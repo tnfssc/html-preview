@@ -46,9 +46,10 @@ export function parseBlobUrl(url: string | URL): RepoRef | null {
 
 export function parsePrFilesUrl(url: string | URL): PrFilesRoute | null {
   const parsed = typeof url === 'string' ? new URL(url) : url;
-  const match = /^\/([^/]+)\/([^/]+)\/pull\/(\d+)\/files\/?$/i.exec(
-    parsed.pathname,
-  );
+  const match =
+    /^\/([^/]+)\/([^/]+)\/pull\/(\d+)\/(?:files|changes)\/?$/i.exec(
+      parsed.pathname,
+    );
   if (!match) return null;
   return {
     owner: decodeSegment(match[1]),

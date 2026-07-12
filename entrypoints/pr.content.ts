@@ -1,9 +1,17 @@
-import { parsePrFilesUrl, type PrFilesRoute } from '@/utils/github';
+import {
+  fetchRepositoryFile,
+  parsePrFilesUrl,
+  type PrFilesRoute,
+} from '@/utils/github';
 import { enabledStorage, githubTokenStorage } from '@/utils/storage';
+import { resolveHtml } from '@/utils/resolveHtml';
+import { renderStaticPreview, type RenderResult } from '@/utils/renderer';
 import type { RepoRef } from '@/utils/types';
 import { debugError, debugLog } from '@/utils/debug';
 
 const PREVIEW_LINK_CLASS = 'gh-html-preview-pr-link';
+const PREVIEW_CONTROLS_CLASS = 'gh-html-preview-pr-controls';
+const RICH_CONTAINER_CLASS = 'gh-html-preview-pr-rich';
 const DIFF_SELECTOR =
   '#files .file, [data-testid="diff-file"], [data-testid="diff-file-header"]';
 
@@ -19,11 +27,27 @@ interface PrRouteState {
   readonly route: PrFilesRoute;
   readonly controller: AbortController;
   readonly metadata: Promise<PullHead>;
+  readonly richDiffs: Set<RichDiffState>;
 }
 
 interface DiffTarget {
+  file: HTMLElement;
   header: HTMLElement;
+  fileContent: HTMLElement;
+  actions: HTMLElement;
   path: string;
+}
+
+interface RichDiffState {
+  readonly target: DiffTarget;
+  readonly sourceButton: HTMLButtonElement;
+  readonly richButton: HTMLButtonElement;
+  readonly container: HTMLElement;
+  readonly status: HTMLElement;
+  readonly previewArea: HTMLElement;
+  controller: AbortController | null;
+  render: RenderResult | null;
+  resolving: Promise<void> | null;
 }
 
 export default defineContentScript({
@@ -35,16 +59,24 @@ export default defineContentScript({
     let state: PrRouteState | null = null;
     let renderTimer: number | null = null;
 
-    const clearLinks = () => {
+    const clearControls = () => {
+      for (const rich of state?.richDiffs ?? []) {
+        rich.controller?.abort();
+        rich.render?.destroy();
+        rich.target.fileContent.style.removeProperty('display');
+        rich.container.remove();
+      }
       document
-        .querySelectorAll(`.${PREVIEW_LINK_CLASS}`)
+        .querySelectorAll(
+          `.${PREVIEW_LINK_CLASS}, .${PREVIEW_CONTROLS_CLASS}, .${RICH_CONTAINER_CLASS}`,
+        )
         .forEach((element) => element.remove());
     };
 
     const stopRoute = () => {
       state?.controller.abort();
+      clearControls();
       state = null;
-      clearLinks();
       if (renderTimer !== null) {
         window.clearTimeout(renderTimer);
         renderTimer = null;
@@ -59,8 +91,8 @@ export default defineContentScript({
         routeState.controller.signal.throwIfAborted();
         if (state !== routeState) return;
         for (const target of targets) {
-          if (target.header.querySelector(`.${PREVIEW_LINK_CLASS}`)) continue;
-          insertPreviewLink(target, head);
+          if (target.header.querySelector(`.${PREVIEW_CONTROLS_CLASS}`)) continue;
+          insertPreviewControls(target, head, githubToken, routeState);
         }
         debugLog('pr', 'buttons-rendered', {
           owner: head.owner,
@@ -106,6 +138,7 @@ export default defineContentScript({
           route: Object.freeze({ ...route }),
           controller,
           metadata: fetchPullHead(route, controller.signal, githubToken),
+          richDiffs: new Set(),
         };
       }
       scheduleRender();
@@ -220,13 +253,23 @@ function findDiffTargets(): DiffTarget[] {
     document.querySelectorAll<HTMLElement>('#files .file'),
   )) {
     const header = file.querySelector<HTMLElement>('.file-header');
+    const fileContent = file.querySelector<HTMLElement>('.js-file-content');
+    const actions = header?.querySelector<HTMLElement>(
+      '.file-actions > .d-flex, .file-actions',
+    );
     const path =
       file.dataset.path ??
       header?.dataset.path ??
       header?.querySelector<HTMLElement>('.file-info a[title]')?.getAttribute('title');
-    if (header && validHtmlPath(path) && !seen.has(header)) {
+    if (
+      header &&
+      fileContent &&
+      actions &&
+      validHtmlPath(path) &&
+      !seen.has(header)
+    ) {
       seen.add(header);
-      targets.push({ header, path });
+      targets.push({ file, header, fileContent, actions, path });
     }
   }
 
@@ -236,11 +279,29 @@ function findDiffTargets(): DiffTarget[] {
     ),
   )) {
     const card = header.closest<HTMLElement>('[data-testid="diff-file"]');
+    const fileContent = card?.querySelector<HTMLElement>(
+      '[data-testid="diff-file-content"], [data-testid="diff-content"]',
+    );
+    const actions = header.querySelector<HTMLElement>(
+      '[data-testid="file-header-actions"]',
+    );
     const pathElement = header.querySelector<HTMLElement>('[data-path]');
     const path = card?.dataset.path ?? header.dataset.path ?? pathElement?.dataset.path;
-    if (validHtmlPath(path) && !seen.has(header)) {
+    if (
+      card &&
+      fileContent &&
+      actions &&
+      validHtmlPath(path) &&
+      !seen.has(header)
+    ) {
       seen.add(header);
-      targets.push({ header, path });
+      targets.push({
+        file: card,
+        header,
+        fileContent,
+        actions,
+        path,
+      });
     }
   }
   return targets;
@@ -255,25 +316,220 @@ function validHtmlPath(path: string | null | undefined): path is string {
   );
 }
 
-function insertPreviewLink(target: DiffTarget, head: PullHead): void {
+function insertPreviewControls(
+  target: DiffTarget,
+  head: PullHead,
+  githubToken: string | null,
+  routeState: PrRouteState,
+): void {
+  const controls = document.createElement('div');
+  controls.className = `${PREVIEW_CONTROLS_CLASS} BtnGroup d-inline-flex`;
+
+  const sourceButton = createDiffButton(
+    'Display the source diff',
+    'source selected',
+    codeIcon(),
+  );
+  sourceButton.setAttribute('aria-current', 'true');
+  const richButton = createDiffButton(
+    'Display the rich diff',
+    'rendered',
+    fileIcon(),
+  );
+  controls.append(sourceButton, richButton);
+
   const link = document.createElement('a');
-  link.className = PREVIEW_LINK_CLASS;
-  link.textContent = 'Preview';
+  link.className = `${PREVIEW_LINK_CLASS} btn btn-sm ml-2`;
+  link.textContent = 'Open preview';
   link.setAttribute('aria-label', `Open full preview for ${target.path}`);
-  link.href = buildPreviewPageUrl({
+  link.href = buildPreviewPageUrl(
+    {
+      owner: head.owner,
+      repo: head.repo,
+      ref: head.sha,
+      path: target.path,
+    },
+    head.privateRepo,
+  );
+  link.target = '_blank';
+  link.rel = 'noreferrer';
+
+  const container = document.createElement('section');
+  container.className = RICH_CONTAINER_CLASS;
+  container.setAttribute('aria-label', `Rich HTML diff for ${target.path}`);
+  container.style.cssText =
+    'display:none;flex-direction:column;height:calc(100dvh - 160px);min-height:500px;border-top:1px solid var(--borderColor-default,#d1d9e0);background:var(--bgColor-default,#fff);';
+  const status = document.createElement('div');
+  status.setAttribute('role', 'status');
+  status.style.cssText =
+    'padding:8px 12px;border-bottom:1px solid var(--borderColor-default,#d1d9e0);color:var(--fgColor-muted,#59636e);font-size:12px;font-weight:600;';
+  status.textContent = 'Ready to render HTML';
+  const previewArea = document.createElement('div');
+  previewArea.style.cssText = 'flex:1;min-height:0;overflow:hidden;';
+  container.append(status, previewArea);
+  target.fileContent.before(container);
+  target.actions.prepend(controls, link);
+
+  const richState: RichDiffState = {
+    target,
+    sourceButton,
+    richButton,
+    container,
+    status,
+    previewArea,
+    controller: null,
+    render: null,
+    resolving: null,
+  };
+  routeState.richDiffs.add(richState);
+
+  sourceButton.addEventListener('click', () => showSourceDiff(richState));
+  richButton.addEventListener('click', () => {
+    showRichDiff(richState);
+    if (!richState.render && !richState.resolving) {
+      richState.resolving = renderRichDiff(
+        richState,
+        head,
+        githubToken,
+        routeState,
+      ).finally(() => {
+        richState.resolving = null;
+      });
+    }
+  });
+}
+
+function showSourceDiff(state: RichDiffState): void {
+  state.controller?.abort();
+  state.controller = null;
+  state.sourceButton.classList.add('selected');
+  state.sourceButton.setAttribute('aria-current', 'true');
+  state.richButton.classList.remove('selected');
+  state.richButton.removeAttribute('aria-current');
+  state.container.style.display = 'none';
+  state.target.fileContent.style.removeProperty('display');
+}
+
+function showRichDiff(state: RichDiffState): void {
+  state.sourceButton.classList.remove('selected');
+  state.sourceButton.removeAttribute('aria-current');
+  state.richButton.classList.add('selected');
+  state.richButton.setAttribute('aria-current', 'true');
+  state.target.fileContent.style.setProperty('display', 'none', 'important');
+  state.container.style.display = 'flex';
+}
+
+async function renderRichDiff(
+  state: RichDiffState,
+  head: PullHead,
+  githubToken: string | null,
+  routeState: PrRouteState,
+): Promise<void> {
+  const controller = new AbortController();
+  state.controller = controller;
+  const abort = () => controller.abort();
+  routeState.controller.signal.addEventListener('abort', abort, { once: true });
+  state.status.textContent = 'Loading HTML…';
+  const repoRef: RepoRef = {
     owner: head.owner,
     repo: head.repo,
     ref: head.sha,
-    path: target.path,
-  }, head.privateRepo);
-  link.target = '_blank';
-  link.rel = 'noreferrer';
-  link.style.cssText =
-    'margin-left:8px;padding:4px 8px;border:1px solid var(--borderColor-default,#d1d9e0);border-radius:6px;background:var(--bgColor-muted,#f6f8fa);color:var(--fgColor-default,#1f2328);font-size:12px;font-weight:600;text-decoration:none;cursor:pointer;';
-  const actions = target.header.querySelector<HTMLElement>(
-    '.file-actions, [data-testid="file-header-actions"]',
+    path: state.target.path,
+  };
+  debugLog('pr', 'rich-diff-start', {
+    owner: head.owner,
+    repo: head.repo,
+    path: state.target.path,
+    privateRepo: head.privateRepo,
+    tokenConfigured: Boolean(githubToken),
+  });
+  try {
+    if (head.privateRepo && !githubToken) {
+      throw new Error(
+        'Save a fine-grained GitHub token in the extension popup to preview this private file.',
+      );
+    }
+    const file = await fetchRepositoryFile(repoRef, controller.signal, {
+      token: githubToken,
+      privateRepo: head.privateRepo,
+    });
+    const result = await resolveHtml(file.text, {
+      target: 'static',
+      repoRef,
+      githubToken,
+      privateRepo: head.privateRepo || file.authenticated,
+      signal: controller.signal,
+    });
+    controller.signal.throwIfAborted();
+    if (!state.container.isConnected || routeState.controller.signal.aborted) return;
+    state.render?.destroy();
+    state.render = renderStaticPreview(state.previewArea, result, {
+      title: `Rich HTML diff for ${state.target.path}`,
+    });
+    state.status.textContent =
+      result.resources.failed > 0 || result.resources.skipped > 0
+        ? 'Partial'
+        : 'Ready';
+    debugLog('pr', 'rich-diff-complete', {
+      path: state.target.path,
+      fetched: result.resources.fetched,
+      inlined: result.resources.inlined,
+      failed: result.resources.failed,
+      skipped: result.resources.skipped,
+    });
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    state.status.textContent =
+      error instanceof Error ? `Error: ${error.message}` : 'Error: Preview failed.';
+    debugError('pr', 'rich-diff-failed', error, {
+      path: state.target.path,
+      privateRepo: head.privateRepo,
+    });
+  } finally {
+    routeState.controller.signal.removeEventListener('abort', abort);
+    if (state.controller === controller) state.controller = null;
+  }
+}
+
+function createDiffButton(
+  label: string,
+  stateClasses: string,
+  icon: SVGSVGElement,
+): HTMLButtonElement {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `btn btn-sm BtnGroup-item tooltipped tooltipped-s ${stateClasses}`;
+  button.setAttribute('aria-label', label);
+  button.appendChild(icon);
+  return button;
+}
+
+function codeIcon(): SVGSVGElement {
+  return createIcon(
+    'M11.28 3.22 15.53 7.47a.75.75 0 0 1 0 1.06l-4.25 4.25a.75.75 0 0 1-1.06-1.06L13.94 8l-3.72-3.72a.75.75 0 0 1 1.06-1.06Zm-6.56 0a.75.75 0 0 1 1.06 1.06L2.06 8l3.72 3.72a.75.75 0 1 1-1.06 1.06L.47 8.53a.75.75 0 0 1 0-1.06Z',
+    'octicon-code',
   );
-  (actions ?? target.header).appendChild(link);
+}
+
+function fileIcon(): SVGSVGElement {
+  return createIcon(
+    'M2 1.75C2 .784 2.784 0 3.75 0h6.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237v9.586A1.75 1.75 0 0 1 13.25 16h-9.5A1.75 1.75 0 0 1 2 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h9.5a.25.25 0 0 0 .25-.25V6h-2.75A1.75 1.75 0 0 1 9 4.25V1.5Z',
+    'octicon-file',
+  );
+}
+
+function createIcon(pathData: string, iconClass: string): SVGSVGElement {
+  const namespace = 'http://www.w3.org/2000/svg';
+  const icon = document.createElementNS(namespace, 'svg');
+  icon.setAttribute('aria-hidden', 'true');
+  icon.setAttribute('height', '16');
+  icon.setAttribute('width', '16');
+  icon.setAttribute('viewBox', '0 0 16 16');
+  icon.setAttribute('class', `octicon ${iconClass}`);
+  const path = document.createElementNS(namespace, 'path');
+  path.setAttribute('d', pathData);
+  icon.appendChild(path);
+  return icon;
 }
 
 function buildPreviewPageUrl(repoRef: RepoRef, privateRepo: boolean): string {

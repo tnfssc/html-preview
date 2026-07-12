@@ -215,7 +215,7 @@ test('full preview executes public repository scripts only inside sandbox', asyn
 test('fork PR gets one preview link for exact head repository and commit', async () => {
   const { context, page } = await launchWithExtension();
   try {
-    const prUrl = 'https://github.com/acme/reports/pull/42/files';
+    const prUrl = 'https://github.com/acme/reports/pull/42/changes';
     const forkSha = 'abcdefabcdefabcdefabcdefabcdefabcdefabcd';
     let apiRequests = 0;
     await context.route('**/*', async (route) => {
@@ -239,6 +239,17 @@ test('fork PR gets one preview link for exact head repository and commit', async
         });
         return;
       }
+      if (
+        url ===
+        `https://raw.githubusercontent.com/contributor/reports-fork/${forkSha}/examples/demo.html`
+      ) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: '<!doctype html><html><body><h2 id="rich-pr">Rich PR HTML</h2><script>globalThis.unsafe = true</script></body></html>',
+        });
+        return;
+      }
       await route.continue();
     });
 
@@ -257,12 +268,33 @@ test('fork PR gets one preview link for exact head repository and commit', async
       path: 'examples/demo.html',
     });
 
+    const htmlDiff = page.locator('.file[data-path="examples/demo.html"]');
+    const richButton = htmlDiff.getByRole('button', {
+      name: 'Display the rich diff',
+    });
+    const sourceButton = htmlDiff.getByRole('button', {
+      name: 'Display the source diff',
+    });
+    await expect(richButton).toHaveClass(/BtnGroup-item/);
+    await richButton.click();
+    const richContainer = htmlDiff.locator('.gh-html-preview-pr-rich');
+    await expect(richContainer.getByRole('status')).toHaveText('Partial');
+    const richFrame = richContainer
+      .locator('iframe[title="Rich HTML diff for examples/demo.html"]')
+      .contentFrame();
+    await expect(richFrame.locator('#rich-pr')).toHaveText('Rich PR HTML');
+    await expect(richFrame.locator('script')).toHaveCount(0);
+    await expect(htmlDiff.locator('.js-file-content')).toBeHidden();
+    await sourceButton.click();
+    await expect(htmlDiff.locator('.js-file-content')).toBeVisible();
+    await expect(richContainer).toBeHidden();
+
     await page.evaluate(() => {
       const file = document.createElement('div');
       file.className = 'file';
       file.dataset.path = 'examples/late.htm';
       file.innerHTML =
-        '<div class="file-header"><div class="file-actions"></div></div>';
+        '<div class="file-header" data-path="examples/late.htm"><div class="file-actions"><div class="d-flex"></div></div></div><div class="js-file-content">Late source diff</div>';
       document.querySelector('#files')?.appendChild(file);
     });
     await expect(previewLink).toHaveCount(1);
@@ -270,6 +302,11 @@ test('fork PR gets one preview link for exact head repository and commit', async
       page.getByRole('link', {
         name: 'Open full preview for examples/late.htm',
       }),
+    ).toHaveCount(1);
+    await expect(
+      page
+        .locator('.file[data-path="examples/late.htm"]')
+        .getByRole('button', { name: 'Display the rich diff' }),
     ).toHaveCount(1);
     expect(apiRequests).toBe(1);
   } finally {
@@ -699,7 +736,10 @@ function githubEmbeddedPayload(
 function githubPrFixture(filePath: string): string {
   return `<!doctype html><html><body><div id="files">
     <div class="file" data-path="${filePath}">
-      <div class="file-header"><div class="file-actions"></div></div>
+      <div class="file-header" data-path="${filePath}">
+        <div class="file-actions"><div class="d-flex"></div></div>
+      </div>
+      <div class="js-file-content">Source diff for ${filePath}</div>
     </div>
   </div></body></html>`;
 }

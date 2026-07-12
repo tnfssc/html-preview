@@ -224,18 +224,18 @@ test('fork PR gets one preview link for exact head repository and commit', async
         await route.fulfill({
           status: 200,
           contentType: 'text/html',
-          body: githubPrFixture('examples/demo.html'),
+          body: githubPrFixture(
+            'examples/demo.html',
+            `/contributor/reports-fork/blob/${forkSha}/examples/demo.html`,
+          ),
         });
         return;
       }
       if (url === 'https://api.github.com/repos/acme/reports/pulls/42') {
         apiRequests += 1;
         await route.fulfill({
-          status: 200,
-          contentType: 'application/json',
-          body: JSON.stringify({
-            head: { sha: forkSha, repo: { full_name: 'contributor/reports-fork' } },
-          }),
+          status: 503,
+          body: 'API unavailable',
         });
         return;
       }
@@ -289,14 +289,14 @@ test('fork PR gets one preview link for exact head repository and commit', async
     await expect(htmlDiff.locator('.js-file-content')).toBeVisible();
     await expect(richContainer).toBeHidden();
 
-    await page.evaluate(() => {
+    await page.evaluate((headSha) => {
       const file = document.createElement('div');
       file.className = 'file';
       file.dataset.path = 'examples/late.htm';
       file.innerHTML =
-        '<div class="file-header" data-path="examples/late.htm"><div class="file-actions"><div class="d-flex"></div></div></div><div class="js-file-content">Late source diff</div>';
+        `<div class="file-header" data-path="examples/late.htm"><a href="/contributor/reports-fork/blob/${headSha}/examples/late.htm" data-ga-click="View file">View file</a><div class="file-actions"><div class="d-flex"></div></div></div><div class="js-file-content">Late source diff</div>`;
       document.querySelector('#files')?.appendChild(file);
-    });
+    }, forkSha);
     await expect(previewLink).toHaveCount(1);
     await expect(
       page.getByRole('link', {
@@ -308,7 +308,7 @@ test('fork PR gets one preview link for exact head repository and commit', async
         .locator('.file[data-path="examples/late.htm"]')
         .getByRole('button', { name: 'Display the rich diff' }),
     ).toHaveCount(1);
-    expect(apiRequests).toBe(1);
+    expect(apiRequests).toBe(0);
   } finally {
     await context.close();
   }
@@ -733,10 +733,15 @@ function githubEmbeddedPayload(
   }).replaceAll('<', '\\u003c');
 }
 
-function githubPrFixture(filePath: string): string {
+function githubPrFixture(filePath: string, viewFileHref?: string): string {
   return `<!doctype html><html><body><div id="files">
     <div class="file" data-path="${filePath}">
       <div class="file-header" data-path="${filePath}">
+        ${
+          viewFileHref
+            ? `<a href="${viewFileHref}" data-ga-click="View file">View file</a>`
+            : ''
+        }
         <div class="file-actions"><div class="d-flex"></div></div>
       </div>
       <div class="js-file-content">Source diff for ${filePath}</div>

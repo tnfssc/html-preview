@@ -1,5 +1,6 @@
 import {
   fetchRepositoryFile,
+  parseBlobUrl,
   parsePrFilesUrl,
   type PrFilesRoute,
 } from '@/utils/github';
@@ -26,7 +27,7 @@ interface PrRouteState {
   readonly key: string;
   readonly route: PrFilesRoute;
   readonly controller: AbortController;
-  readonly metadata: Promise<PullHead>;
+  metadata: Promise<PullHead> | null;
   readonly richDiffs: Set<RichDiffState>;
 }
 
@@ -36,6 +37,7 @@ interface DiffTarget {
   fileContent: HTMLElement;
   actions: HTMLElement;
   path: string;
+  repoRef: RepoRef | null;
 }
 
 interface RichDiffState {
@@ -99,11 +101,42 @@ export default defineContentScript({
         targets: targets.length,
       });
       if (targets.length === 0) return;
+      const unresolved: DiffTarget[] = [];
+      for (const target of targets) {
+        if (target.header.querySelector(`.${PREVIEW_CONTROLS_CLASS}`)) continue;
+        if (target.repoRef) {
+          insertPreviewControls(
+            target,
+            {
+              owner: target.repoRef.owner,
+              repo: target.repoRef.repo,
+              sha: target.repoRef.ref,
+              privateRepo: false,
+            },
+            githubToken,
+            routeState,
+          );
+        } else {
+          unresolved.push(target);
+        }
+      }
+      if (unresolved.length === 0) {
+        debugLog('pr', 'buttons-rendered', {
+          targets: targets.length,
+          source: 'view-file-links',
+        });
+        return;
+      }
       try {
+        routeState.metadata ??= fetchPullHead(
+          routeState.route,
+          routeState.controller.signal,
+          githubToken,
+        );
         const head = await routeState.metadata;
         routeState.controller.signal.throwIfAborted();
         if (state !== routeState) return;
-        for (const target of targets) {
+        for (const target of unresolved) {
           if (target.header.querySelector(`.${PREVIEW_CONTROLS_CLASS}`)) continue;
           insertPreviewControls(target, head, githubToken, routeState);
         }
@@ -111,7 +144,8 @@ export default defineContentScript({
           owner: head.owner,
           repo: head.repo,
           privateRepo: head.privateRepo,
-          targets: targets.length,
+          targets: unresolved.length,
+          source: 'pull-api',
         });
       } catch (error) {
         if (
@@ -155,7 +189,7 @@ export default defineContentScript({
           key,
           route: Object.freeze({ ...route }),
           controller,
-          metadata: fetchPullHead(route, controller.signal, githubToken),
+          metadata: null,
           richDiffs: new Set(),
         };
       }
@@ -287,7 +321,14 @@ function findDiffTargets(): DiffTarget[] {
       !seen.has(header)
     ) {
       seen.add(header);
-      targets.push({ file, header, fileContent, actions, path });
+      targets.push({
+        file,
+        header,
+        fileContent,
+        actions,
+        path,
+        repoRef: findViewFileRepoRef(header, path),
+      });
     }
   }
 
@@ -319,10 +360,30 @@ function findDiffTargets(): DiffTarget[] {
         fileContent,
         actions,
         path,
+        repoRef: findViewFileRepoRef(header, path),
       });
     }
   }
   return targets;
+}
+
+function findViewFileRepoRef(
+  header: HTMLElement,
+  expectedPath: string,
+): RepoRef | null {
+  for (const link of Array.from(
+    header.querySelectorAll<HTMLAnchorElement>('a[href*="/blob/"]'),
+  )) {
+    const parsed = parseBlobUrl(new URL(link.href, location.href));
+    if (
+      parsed &&
+      parsed.path === expectedPath &&
+      /^[0-9a-f]{40}$/i.test(parsed.ref)
+    ) {
+      return parsed;
+    }
+  }
+  return null;
 }
 
 function validHtmlPath(path: string | null | undefined): path is string {
@@ -362,8 +423,9 @@ function insertPreviewControls(
 
   const link = document.createElement('a');
   link.className = `${PREVIEW_LINK_CLASS} btn btn-sm ml-2`;
-  link.textContent = 'Open preview';
+  link.textContent = 'Preview HTML';
   link.setAttribute('aria-label', `Open full preview for ${target.path}`);
+  link.title = 'Open full HTML preview';
   link.href = buildPreviewPageUrl(
     {
       owner: head.owner,
@@ -522,6 +584,7 @@ function createDiffButton(
   button.type = 'button';
   button.className = `btn btn-sm BtnGroup-item tooltipped tooltipped-s ${stateClasses}`;
   button.setAttribute('aria-label', label);
+  button.title = label;
   button.appendChild(icon);
   return button;
 }

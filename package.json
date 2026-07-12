@@ -2,7 +2,7 @@
   "name": "github-html-preview",
   "description": "Safely preview public HTML files and pull-request changes on GitHub",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "scripts": {
     "dev": "wxt",

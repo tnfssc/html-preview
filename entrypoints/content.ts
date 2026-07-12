@@ -119,10 +119,7 @@ export default defineContentScript({
 
       const details = document.createElement('p');
       details.style.cssText =
-        'margin:0;padding:8px 12px;border-bottom:1px solid var(--borderColor-default,#d1d9e0);font-size:12px;color:var(--fgColor-muted,#59636e);';
-      details.textContent =
-        pageData.diagnostic ??
-        'Static preview blocks scripts and external network. Repository assets load on demand.';
+        'display:none;margin:0;padding:8px 12px;border-bottom:1px solid var(--borderColor-default,#d1d9e0);font-size:12px;color:var(--fgColor-muted,#59636e);';
 
       const previewArea = document.createElement('div');
       previewArea.style.cssText = 'flex:1;min-height:0;overflow:hidden;';
@@ -265,7 +262,8 @@ export default defineContentScript({
 async function ensureResolved(route: RouteState): Promise<void> {
   if (route.render || route.resolving) return route.resolving ?? Promise.resolve();
   route.status.textContent = 'Loading';
-  route.details.textContent = 'Fetching and inlining repository resources…';
+  route.details.style.display = 'none';
+  route.details.textContent = '';
   route.previewArea.replaceChildren(message('Loading static preview…'));
 
   route.resolving = (async () => {
@@ -284,6 +282,7 @@ async function ensureResolved(route: RouteState): Promise<void> {
     } catch (error) {
       if (route.controller.signal.aborted) return;
       route.status.textContent = 'Error';
+      route.details.style.display = 'block';
       route.details.textContent =
         error instanceof Error ? error.message : 'Static preview failed.';
       route.previewArea.replaceChildren(
@@ -302,13 +301,8 @@ function updateResolvedStatus(route: RouteState, result: ResolveResult): void {
     result.resources.failed > 0 ||
     result.resources.skipped > 0;
   route.status.textContent = partial ? 'Partial' : 'Ready';
-  const summary = `${result.resources.inlined} resources inlined, ${formatBytes(result.resources.bytes)} fetched`;
-  if (partial) {
-    const first = result.diagnostics[0]?.message ?? route.metadataDiagnostic;
-    route.details.textContent = first ? `${summary}. ${first}` : `${summary}. Some resources were omitted.`;
-  } else {
-    route.details.textContent = `${summary}. Scripts and external network remain blocked.`;
-  }
+  route.details.style.display = 'none';
+  route.details.textContent = '';
 }
 
 function findTabBar(): HTMLElement | null {
@@ -422,12 +416,6 @@ function message(text: string): HTMLParagraphElement {
   element.style.cssText = 'margin:0;padding:24px;text-align:center;';
   element.textContent = text;
   return element;
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 function removeOrphanedUi(): void {

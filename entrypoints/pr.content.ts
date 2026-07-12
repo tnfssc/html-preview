@@ -54,6 +54,9 @@ export default defineContentScript({
   matches: ['*://github.com/*'],
   runAt: 'document_end',
   main(ctx) {
+    debugLog('pr', 'content-script-start', {
+      path: location.pathname,
+    });
     let enabled = true;
     let githubToken: string | null = null;
     let state: PrRouteState | null = null;
@@ -85,6 +88,16 @@ export default defineContentScript({
 
     const renderCards = async (routeState: PrRouteState) => {
       const targets = findDiffTargets();
+      debugLog('pr', 'target-scan', {
+        classicCards: document.querySelectorAll('#files .file').length,
+        testHeaders: document.querySelectorAll(
+          '[data-testid="diff-file-header"], [data-testid="file-header"]',
+        ).length,
+        htmlDataPaths: Array.from(
+          document.querySelectorAll<HTMLElement>('[data-path]'),
+        ).filter((element) => validHtmlPath(element.dataset.path)).length,
+        targets: targets.length,
+      });
       if (targets.length === 0) return;
       try {
         const head = await routeState.metadata;
@@ -125,6 +138,11 @@ export default defineContentScript({
 
     const reconcileRoute = () => {
       const route = enabled ? parsePrFilesUrl(location.href) : null;
+      debugLog('pr', 'route-reconcile', {
+        path: location.pathname,
+        enabled,
+        matched: Boolean(route),
+      });
       if (!route) {
         stopRoute();
         return;
@@ -322,6 +340,10 @@ function insertPreviewControls(
   githubToken: string | null,
   routeState: PrRouteState,
 ): void {
+  debugLog('pr', 'controls-insert', {
+    path: target.path,
+    privateRepo: head.privateRepo,
+  });
   const controls = document.createElement('div');
   controls.className = `${PREVIEW_CONTROLS_CLASS} BtnGroup d-inline-flex`;
 

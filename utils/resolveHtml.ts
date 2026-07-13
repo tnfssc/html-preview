@@ -15,6 +15,7 @@ const DEFAULT_LIMITS: ResolveLimits = {
   maxTotalBytes: 25 * 1024 * 1024,
   maxDepth: 4,
   concurrency: 6,
+  maxOutputBytes: 40 * 1024 * 1024,
 };
 
 const MEDIA_TYPES: Record<string, string> = {
@@ -47,17 +48,6 @@ const MEDIA_TYPES: Record<string, string> = {
   woff2: 'font/woff2',
 };
 
-const SAFE_DATA_IMAGE_TYPES = new Set([
-  'image/avif',
-  'image/bmp',
-  'image/gif',
-  'image/jpeg',
-  'image/png',
-  'image/svg+xml',
-  'image/webp',
-  'image/x-icon',
-]);
-
 interface RepositoryUrl {
   kind: 'repo' | 'external' | 'data' | 'fragment' | 'invalid';
   value: string;
@@ -70,8 +60,6 @@ interface ResourceData {
   bytes: Uint8Array;
   mime: string;
 }
-
-type ResourcePurpose = 'image' | 'font' | 'media' | 'text';
 
 class ResourceLoader {
   readonly diagnostics: ResolveDiagnostic[] = [];
@@ -162,6 +150,7 @@ export async function resolveHtml(
   html: string,
   options: ResolveOptions,
 ): Promise<ResolveResult> {
+  const startedAt = performance.now();
   options.signal?.throwIfAborted();
   const limits = validateLimits({ ...DEFAULT_LIMITS, ...options.limits });
   const signal = options.signal ?? new AbortController().signal;
@@ -182,19 +171,28 @@ export async function resolveHtml(
   const doc = new DOMParser().parseFromString(html, 'text/html');
   const sourcePath = resolveBasePath(doc, options.repoRef, loader);
 
-  if (options.target === 'static') {
-    await resolveStaticDocument(doc, sourcePath, loader);
-  } else if (options.target === 'sandbox') {
+  if (options.target === 'sandbox') {
     await resolveSandboxDocument(doc, sourcePath, loader);
   } else {
     await resolvePrivateSandboxDocument(doc, sourcePath, loader);
   }
 
   options.signal?.throwIfAborted();
+  const resolvedHtml = `<!doctype html>\n${doc.documentElement.outerHTML}`;
+  const outputBytes = new TextEncoder().encode(resolvedHtml).byteLength;
+  if (outputBytes > limits.maxOutputBytes) {
+    throw new Error(
+      `Resolved preview exceeds ${limits.maxOutputBytes} byte output limit.`,
+    );
+  }
   const result = {
-    html: `<!doctype html>\n${doc.documentElement.outerHTML}`,
+    html: resolvedHtml,
     diagnostics: loader.diagnostics,
     resources: { ...loader.stats },
+    performance: {
+      resolveMs: performance.now() - startedAt,
+      outputBytes,
+    },
   };
   debugLog('resolver', 'complete', {
     target: options.target,
@@ -206,6 +204,8 @@ export async function resolveHtml(
     failed: result.resources.failed,
     bytes: result.resources.bytes,
     diagnostics: result.diagnostics.length,
+    resolveMs: Math.round(result.performance.resolveMs),
+    outputBytes,
   });
   return result;
 }
@@ -262,151 +262,6 @@ export function resolveRepositoryUrl(
   }
 }
 
-async function resolveStaticDocument(
-  doc: Document,
-  sourcePath: string,
-  loader: ResourceLoader,
-): Promise<void> {
-  for (const element of Array.from(
-    doc.querySelectorAll('script, iframe, frame, object, embed, portal, fencedframe'),
-  )) {
-    element.remove();
-    loader.stats.skipped += 1;
-  }
-
-  for (const meta of Array.from(doc.querySelectorAll('meta[http-equiv]'))) {
-    const directive = meta.getAttribute('http-equiv')?.toLowerCase();
-    if (directive === 'refresh' || directive === 'content-security-policy') {
-      meta.remove();
-    }
-  }
-  installStaticCsp(doc);
-  doc.querySelectorAll('base').forEach((base) => base.remove());
-
-  const stylesheetLinks = Array.from(
-    doc.querySelectorAll<HTMLLinkElement>('link[rel~="stylesheet"][href]'),
-  );
-  await Promise.all(
-    stylesheetLinks.map(async (link) => {
-      const href = link.getAttribute('href');
-      if (!href) return;
-      const resolved = resolveRepositoryUrl(href, loader.repoRef, sourcePath);
-      if (resolved.kind !== 'repo' || !resolved.path) {
-        link.remove();
-        loader.stats.skipped += 1;
-        loader.addDiagnostic(
-          'external-stylesheet-removed',
-          'Static preview removed non-repository stylesheet.',
-          href,
-        );
-        return;
-      }
-      try {
-        const resource = await loader.load(resolved.path, resolved.search);
-        const css = new TextDecoder().decode(resource.bytes);
-        const inlined = await inlineStaticCss(css, resolved.path, 1, loader);
-        const style = doc.createElement('style');
-        style.textContent = inlined;
-        link.replaceWith(style);
-        loader.stats.inlined += 1;
-      } catch (error) {
-        link.remove();
-        recordResourceFailure(loader, href, error);
-      }
-    }),
-  );
-
-  for (const style of Array.from(doc.querySelectorAll('style'))) {
-    style.textContent = await inlineStaticCss(
-      style.textContent ?? '',
-      sourcePath,
-      0,
-      loader,
-    );
-  }
-
-  await Promise.all(
-    Array.from(doc.querySelectorAll<HTMLElement>('[style]')).map(async (element) => {
-      const css = element.getAttribute('style');
-      if (css !== null) {
-        element.setAttribute(
-          'style',
-          await rewriteCssUrls(css, sourcePath, loader, true),
-        );
-      }
-    }),
-  );
-
-  const attributeJobs: Array<Promise<void>> = [];
-  const queueAttribute = (
-    selector: string,
-    attribute: string,
-    purpose: ResourcePurpose,
-  ) => {
-    for (const element of Array.from(doc.querySelectorAll(selector))) {
-      attributeJobs.push(
-        inlineElementAttribute(element, attribute, purpose, sourcePath, loader),
-      );
-    }
-  };
-
-  queueAttribute('img[src], input[type="image"][src]', 'src', 'image');
-  queueAttribute('video[poster]', 'poster', 'image');
-  queueAttribute('video[src], audio[src], source[src]', 'src', 'media');
-  queueAttribute('track[src]', 'src', 'text');
-  queueAttribute('[background]', 'background', 'image');
-  queueAttribute('svg image[href], svg use[href], svg feImage[href]', 'href', 'image');
-  queueAttribute(
-    'svg image[xlink\\:href], svg use[xlink\\:href], svg feImage[xlink\\:href]',
-    'xlink:href',
-    'image',
-  );
-  await Promise.all(attributeJobs);
-
-  await Promise.all(
-    Array.from(doc.querySelectorAll('img[srcset], source[srcset]')).map(
-      async (element) => {
-        const srcset = element.getAttribute('srcset');
-        if (srcset === null) return;
-        const resolved = await transformSrcset(srcset, async (url) => {
-          return staticResourceValue(url, 'image', sourcePath, loader);
-        });
-        if (resolved) element.setAttribute('srcset', resolved);
-        else element.removeAttribute('srcset');
-      },
-    ),
-  );
-
-  for (const link of Array.from(doc.querySelectorAll('link'))) {
-    const rel = link.getAttribute('rel')?.toLowerCase() ?? '';
-    if (!rel.split(/\s+/).some((token) => token === 'stylesheet')) {
-      link.remove();
-      loader.stats.skipped += 1;
-    }
-  }
-
-  for (const element of Array.from(doc.querySelectorAll('*'))) {
-    for (const attribute of Array.from(element.attributes)) {
-      const name = attribute.name.toLowerCase();
-      if (name.startsWith('on') || name === 'ping' || name === 'srcdoc') {
-        element.removeAttribute(attribute.name);
-      }
-    }
-  }
-
-  for (const anchor of Array.from(doc.querySelectorAll('[href]'))) {
-    const href = anchor.getAttribute('href');
-    if (href && !href.startsWith('#') && !anchor.closest('svg')) {
-      anchor.removeAttribute('href');
-    }
-  }
-  for (const formAttribute of ['action', 'formaction']) {
-    doc.querySelectorAll(`[${formAttribute}]`).forEach((element) => {
-      element.removeAttribute(formAttribute);
-    });
-  }
-}
-
 async function resolveSandboxDocument(
   doc: Document,
   sourcePath: string,
@@ -427,6 +282,43 @@ async function resolveSandboxDocument(
     },
   });
   doc.head.prepend(base, importMap);
+
+  const stylesheetLinks = Array.from(
+    doc.querySelectorAll<HTMLLinkElement>('link[rel~="stylesheet"][href]'),
+  );
+  await Promise.all(
+    stylesheetLinks.map(async (link) => {
+      const href = link.getAttribute('href');
+      if (!href) return;
+      const resolved = resolveRepositoryUrl(href, loader.repoRef, sourcePath);
+      if (resolved.kind !== 'repo' || !resolved.path) return;
+      try {
+        const resource = await loader.load(resolved.path, resolved.search);
+        const css = await inlineRepositoryCss(
+          new TextDecoder().decode(resource.bytes),
+          resolved.path,
+          1,
+          loader,
+        );
+        link.href = resourceDataUrl(
+          new TextEncoder().encode(css),
+          'text/css',
+        );
+        loader.stats.inlined += 1;
+      } catch (error) {
+        link.remove();
+        recordResourceFailure(loader, href, error);
+      }
+    }),
+  );
+
+  const moduleMap = await packageRepositoryScripts(doc, sourcePath, loader);
+  importMap.textContent = JSON.stringify({
+    imports: {
+      'https://cdn.jsdelivr.net/': buildJsdelivrUrl(loader.repoRef, ''),
+      ...moduleMap,
+    },
+  });
 
   const urlAttributes = [
     'href',
@@ -488,7 +380,7 @@ async function resolveSandboxDocument(
       if (css !== null) {
         element.setAttribute(
           'style',
-          await rewriteCssUrls(css, sourcePath, loader, false),
+          await rewriteCssUrls(css, sourcePath, loader),
         );
       }
     }),
@@ -516,15 +408,14 @@ async function resolvePrivateSandboxDocument(
       if (resolved.kind !== 'repo' || !resolved.path) return;
       try {
         const resource = await loader.load(resolved.path, resolved.search);
-        const css = await inlinePrivateCss(
-          new TextDecoder().decode(resource.bytes),
-          resolved.path,
-          1,
-          loader,
+        const css = await inlineRepositoryCss(new TextDecoder().decode(resource.bytes),
+        resolved.path,
+        1,
+        loader,);
+        link.href = resourceDataUrl(
+          new TextEncoder().encode(css),
+          'text/css',
         );
-        const style = doc.createElement('style');
-        style.textContent = css;
-        link.replaceWith(style);
         loader.stats.inlined += 1;
       } catch (error) {
         link.remove();
@@ -534,12 +425,10 @@ async function resolvePrivateSandboxDocument(
   );
 
   for (const style of Array.from(doc.querySelectorAll('style'))) {
-    style.textContent = await inlinePrivateCss(
-      style.textContent ?? '',
-      sourcePath,
-      0,
-      loader,
-    );
+    style.textContent = await inlineRepositoryCss(style.textContent ?? '',
+    sourcePath,
+    0,
+    loader,);
   }
   await Promise.all(
     Array.from(doc.querySelectorAll<HTMLElement>('[style]')).map(
@@ -588,6 +477,21 @@ async function resolvePrivateSandboxDocument(
     ),
   );
 
+  const moduleMap = await packageRepositoryScripts(doc, sourcePath, loader);
+
+  if (Object.keys(moduleMap).length > 0) {
+    const importMap = doc.createElement('script');
+    importMap.type = 'importmap';
+    importMap.textContent = JSON.stringify({ imports: moduleMap });
+    doc.head.prepend(importMap);
+  }
+}
+
+async function packageRepositoryScripts(
+  doc: Document,
+  sourcePath: string,
+  loader: ResourceLoader,
+): Promise<Record<string, string>> {
   const moduleMap: Record<string, string> = {};
   for (const script of Array.from(
     doc.querySelectorAll<HTMLScriptElement>('script[src]'),
@@ -619,33 +523,26 @@ async function resolvePrivateSandboxDocument(
     doc.querySelectorAll<HTMLScriptElement>('script[type="module"]:not([src])'),
   )) {
     try {
-      const transformed = await rewriteModuleSource(
+      script.textContent = await rewriteModuleSource(
         script.textContent ?? '',
         sourcePath,
         loader,
         moduleMap,
         new Map<string, string>(),
       );
-      script.textContent = transformed;
     } catch (error) {
       loader.addDiagnostic(
-        'private-inline-module-failed',
+        'inline-module-failed',
         error instanceof Error ? error.message : 'Inline module rewrite failed.',
         undefined,
         'error',
       );
     }
   }
-
-  if (Object.keys(moduleMap).length > 0) {
-    const importMap = doc.createElement('script');
-    importMap.type = 'importmap';
-    importMap.textContent = JSON.stringify({ imports: moduleMap });
-    doc.head.prepend(importMap);
-  }
+  return moduleMap;
 }
 
-async function inlinePrivateCss(
+async function inlineRepositoryCss(
   css: string,
   sourcePath: string,
   depth: number,
@@ -670,12 +567,10 @@ async function inlinePrivateCss(
     }
     try {
       const resource = await loader.load(resolved.path, resolved.search);
-      const nested = await inlinePrivateCss(
-        new TextDecoder().decode(resource.bytes),
-        resolved.path,
-        depth + 1,
-        loader,
-      );
+      const nested = await inlineRepositoryCss(new TextDecoder().decode(resource.bytes),
+      resolved.path,
+      depth + 1,
+      loader,);
       loader.stats.inlined += 1;
       return media ? `@media ${media} {\n${nested}\n}` : nested;
     } catch (error) {
@@ -804,6 +699,7 @@ async function rewriteModuleSource(
       }
       continue;
     }
+    if (!isRepositoryModuleSpecifier(record.n)) continue;
     const resolved = resolveRepositoryUrl(record.n, loader.repoRef, sourcePath);
     if (resolved.kind !== 'repo' || !resolved.path) continue;
     const virtualUrl = privateModuleUrl(resolved.path);
@@ -818,6 +714,17 @@ async function rewriteModuleSource(
       transformed.slice(replacement.end);
   }
   return transformed;
+}
+
+function isRepositoryModuleSpecifier(specifier: string): boolean {
+  return (
+    specifier.startsWith('./') ||
+    specifier.startsWith('../') ||
+    specifier.startsWith('/') ||
+    specifier.startsWith('http://') ||
+    specifier.startsWith('https://') ||
+    specifier.startsWith('//')
+  );
 }
 
 function privateModuleUrl(path: string): string {
@@ -863,73 +770,18 @@ async function rewriteSandboxCss(
       return '';
     },
   );
-  return rewriteCssUrls(importsRewritten, sourcePath, loader, false);
-}
-
-async function inlineStaticCss(
-  css: string,
-  sourcePath: string,
-  depth: number,
-  loader: ResourceLoader,
-): Promise<string> {
-  loader.stats.maxDepthReached = Math.max(loader.stats.maxDepthReached, depth);
-  const importPattern = /@import\s+(?:url\(\s*(["']?)(.*?)\1\s*\)|(["'])(.*?)\3)\s*([^;]*);/gi;
-  const withoutImports = await replaceAsync(css, importPattern, async (match) => {
-    const url = match[2] || match[4];
-    const media = match[5]?.trim();
-    const resolved = resolveRepositoryUrl(url, loader.repoRef, sourcePath);
-    if (resolved.kind !== 'repo' || !resolved.path) {
-      loader.stats.skipped += 1;
-      loader.addDiagnostic(
-        'css-import-removed',
-        'Static preview removed non-repository CSS import.',
-        url,
-      );
-      return '';
-    }
-    if (depth >= loader.limits.maxDepth) {
-      loader.stats.skipped += 1;
-      loader.addDiagnostic(
-        'css-depth-limit',
-        `CSS import exceeded depth limit ${loader.limits.maxDepth}.`,
-        url,
-      );
-      return '';
-    }
-    try {
-      const resource = await loader.load(resolved.path, resolved.search);
-      const nested = await inlineStaticCss(
-        new TextDecoder().decode(resource.bytes),
-        resolved.path,
-        depth + 1,
-        loader,
-      );
-      loader.stats.inlined += 1;
-      return media ? `@media ${media} {\n${nested}\n}` : nested;
-    } catch (error) {
-      recordResourceFailure(loader, url, error);
-      return '';
-    }
-  });
-  return rewriteCssUrls(withoutImports, sourcePath, loader, true);
+  return rewriteCssUrls(importsRewritten, sourcePath, loader);
 }
 
 async function rewriteCssUrls(
   css: string,
   sourcePath: string,
   loader: ResourceLoader,
-  inline: boolean,
 ): Promise<string> {
   const urlPattern = /url\(\s*(["']?)(.*?)\1\s*\)/gi;
   return replaceAsync(css, urlPattern, async (match) => {
     const url = match[2].trim();
     if (!url || url.startsWith('#')) return match[0];
-    if (inline) {
-      const purpose = inferCssPurpose(url);
-      const value = await staticResourceValue(url, purpose, sourcePath, loader);
-      return value ? `url("${value.replaceAll('"', '%22')}")` : 'url("")';
-    }
-
     const resolved = resolveRepositoryUrl(url, loader.repoRef, sourcePath);
     if (resolved.kind === 'repo' && resolved.path !== undefined) {
       loader.stats.rewritten += 1;
@@ -940,79 +792,6 @@ async function rewriteCssUrls(
     }
     return match[0];
   });
-}
-
-async function inlineElementAttribute(
-  element: Element,
-  attribute: string,
-  purpose: ResourcePurpose,
-  sourcePath: string,
-  loader: ResourceLoader,
-): Promise<void> {
-  const value = element.getAttribute(attribute);
-  if (!value) return;
-  const inlined = await staticResourceValue(
-    value,
-    purpose,
-    sourcePath,
-    loader,
-  );
-  if (inlined) element.setAttribute(attribute, inlined);
-  else element.removeAttribute(attribute);
-}
-
-async function staticResourceValue(
-  value: string,
-  purpose: ResourcePurpose,
-  sourcePath: string,
-  loader: ResourceLoader,
-): Promise<string | null> {
-  const resolved = resolveRepositoryUrl(value, loader.repoRef, sourcePath);
-  if (resolved.kind === 'fragment') return resolved.value;
-  if (resolved.kind === 'data') {
-    const safe = sanitizeExistingDataUrl(resolved.value, purpose, loader);
-    if (!safe) {
-      loader.stats.skipped += 1;
-      loader.addDiagnostic(
-        'unsafe-data-url-removed',
-        'Static preview removed unsupported data URL.',
-      );
-    }
-    return safe;
-  }
-  if (resolved.kind !== 'repo' || !resolved.path) {
-    loader.stats.skipped += 1;
-    loader.addDiagnostic(
-      'external-resource-removed',
-      'Static preview removed non-repository resource.',
-      value,
-    );
-    return null;
-  }
-
-  try {
-    const resource = await loader.load(resolved.path, resolved.search);
-    let bytes = resource.bytes;
-    let mime = normalizedMime(resource.mime, resolved.path);
-    if (mime === 'image/svg+xml') {
-      const sanitized = sanitizeSvg(new TextDecoder().decode(bytes), loader);
-      bytes = new TextEncoder().encode(sanitized);
-    }
-    if (!isAllowedDataMime(mime, purpose)) {
-      loader.stats.skipped += 1;
-      loader.addDiagnostic(
-        'unsupported-resource-type',
-        `Static preview cannot inline ${mime}.`,
-        value,
-      );
-      return null;
-    }
-    loader.stats.inlined += 1;
-    return `data:${mime};base64,${bytesToBase64(bytes)}`;
-  } catch (error) {
-    recordResourceFailure(loader, value, error);
-    return null;
-  }
 }
 
 export async function transformSrcset(
@@ -1122,98 +901,8 @@ function repositoryCdnUrl(resolved: RepositoryUrl, repoRef: RepoRef): string {
   return `${buildJsdelivrUrl(repoRef, resolved.path ?? '')}${resolved.search ?? ''}${resolved.hash ?? ''}`;
 }
 
-function installStaticCsp(doc: Document): void {
-  doc.querySelectorAll('meta[http-equiv="Content-Security-Policy" i]').forEach(
-    (meta) => meta.remove(),
-  );
-  const meta = doc.createElement('meta');
-  meta.httpEquiv = 'Content-Security-Policy';
-  meta.content = [
-    "default-src 'none'",
-    "base-uri 'none'",
-    "connect-src 'none'",
-    "font-src data:",
-    "form-action 'none'",
-    "frame-src 'none'",
-    "img-src data:",
-    "media-src data:",
-    "object-src 'none'",
-    "script-src 'none'",
-    "style-src 'unsafe-inline'",
-    "worker-src 'none'",
-  ].join('; ');
-  doc.head.prepend(meta);
-}
-
-function sanitizeExistingDataUrl(
-  value: string,
-  purpose: ResourcePurpose,
-  loader: ResourceLoader,
-): string | null {
-  const match = /^data:([^;,]+)?((?:;[^,]*)?),(.*)$/is.exec(value);
-  if (!match) return null;
-  const mime = (match[1] || 'text/plain').toLowerCase();
-  if (!isAllowedDataMime(mime, purpose)) return null;
-  if (mime !== 'image/svg+xml') return value;
-
-  try {
-    const parameters = match[2].toLowerCase();
-    const decoded = parameters.includes(';base64')
-      ? atob(match[3].replace(/\s/g, ''))
-      : decodeURIComponent(match[3]);
-    const sanitized = sanitizeSvg(decoded, loader);
-    return `data:image/svg+xml;base64,${bytesToBase64(new TextEncoder().encode(sanitized))}`;
-  } catch {
-    return null;
-  }
-}
-
-function sanitizeSvg(svg: string, loader: ResourceLoader): string {
-  const doc = new DOMParser().parseFromString(svg, 'image/svg+xml');
-  doc.querySelectorAll('script, foreignObject, iframe, object, embed').forEach(
-    (element) => element.remove(),
-  );
-  for (const element of Array.from(doc.querySelectorAll('*'))) {
-    for (const attribute of Array.from(element.attributes)) {
-      const name = attribute.name.toLowerCase();
-      const value = attribute.value.trim();
-      if (
-        name.startsWith('on') ||
-        name === 'style' ||
-        ((name === 'href' || name === 'xlink:href') && !value.startsWith('#'))
-      ) {
-        element.removeAttribute(attribute.name);
-      }
-    }
-  }
-  loader.addDiagnostic(
-    'svg-sanitized',
-    'Static preview removed active or network-capable SVG content.',
-  );
-  return new XMLSerializer().serializeToString(doc.documentElement);
-}
-
-function isAllowedDataMime(mime: string, purpose: ResourcePurpose): boolean {
-  if (purpose === 'image') return SAFE_DATA_IMAGE_TYPES.has(mime);
-  if (purpose === 'font') return mime.startsWith('font/');
-  if (purpose === 'media') return mime.startsWith('audio/') || mime.startsWith('video/');
-  return mime === 'text/vtt' || mime === 'text/plain';
-}
-
-function inferCssPurpose(url: string): ResourcePurpose {
-  const dataMime = /^data:([^;,]+)/i.exec(url)?.[1]?.toLowerCase();
-  if (dataMime?.startsWith('font/')) return 'font';
-  if (dataMime?.startsWith('audio/') || dataMime?.startsWith('video/')) {
-    return 'media';
-  }
-  const mime = mimeTypeFromPath(url);
-  if (mime.startsWith('font/')) return 'font';
-  if (mime.startsWith('audio/') || mime.startsWith('video/')) return 'media';
-  return 'image';
-}
-
 function normalizedMime(mime: string, path: string): string {
-  const lower = mime.toLowerCase();
+  const lower = mime.toLowerCase().split(';')[0].trim();
   const inferred = mimeTypeFromPath(path);
   if (
     (lower === 'application/octet-stream' || lower === 'text/plain') &&
@@ -1294,6 +983,7 @@ function validateLimits(limits: ResolveLimits): ResolveLimits {
   if (
     limits.maxResourceBytes <= 0 ||
     limits.maxTotalBytes <= 0 ||
+    limits.maxOutputBytes <= 0 ||
     limits.maxDepth < 0 ||
     limits.concurrency < 1
   ) {

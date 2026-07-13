@@ -16,10 +16,12 @@ const privatePrUrl =
 const previewHtml = `<!doctype html><html><head>
   <link rel="stylesheet" href="/assets/site.css">
 </head><body onload="window.inlineRan = true">
-  <h2 id="script-result">Waiting for script</h2>
+  <h2 id="script-result" class="report">Waiting for script</h2>
+  <output id="external-result">Waiting for external script</output>
   <img id="chart" src="./chart.png" alt="Chart">
   <iframe src="https://tracker.example/frame"></iframe>
   <script src="./app.js"></script>
+  <script src="https://external.example/analytics.js"></script>
 </body></html>`;
 
 const privatePreviewHtml = `<!doctype html><html><head>
@@ -79,6 +81,14 @@ async function routeProductFixtures(
       });
       return;
     }
+    if (url === `${rawBase}/reports/weekly/app.js`) {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/javascript',
+        body: `document.querySelector('#script-result').textContent = 'Script executed';`,
+      });
+      return;
+    }
     if (url === `${cdnBase}/reports/weekly/app.js`) {
       await route.fulfill({
         status: 200,
@@ -106,19 +116,28 @@ async function routeProductFixtures(
       });
       return;
     }
+    if (url === 'https://external.example/analytics.js') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/javascript',
+        body: `document.querySelector('#external-result').textContent = 'External script executed';`,
+      });
+      return;
+    }
     if (url.startsWith('https://tracker.example/')) {
       await route.abort('blockedbyclient');
       return;
     }
-    await route.continue();
+    if (url.startsWith('chrome-extension://')) await route.continue();
+    else await route.abort('blockedbyclient');
   });
   return requested;
 }
 
-test('blob preview executes repository scripts inside sandbox', async () => {
+test('blob preview embeds local CSS and executable script sources in a sandbox', async () => {
   const { context, page } = await launchWithExtension();
   try {
-    const requested = await routeProductFixtures(context);
+    await routeProductFixtures(context);
     await page.goto(blobUrl, { waitUntil: 'domcontentloaded' });
 
     const previewButton = page.getByRole('tab', { name: 'Preview' });
@@ -134,9 +153,12 @@ test('blob preview executes repository scripts inside sandbox', async () => {
     await previewButton.click();
 
     const container = page.locator('.gh-html-preview-container');
-    await expect(container.getByRole('status')).toHaveText('Ready');
-    const iframe = container.locator('iframe[title="Static HTML preview"]');
+    await expect(container.getByRole('status')).toHaveText(
+      'Executable preview ready',
+    );
+    const iframe = container.locator('iframe[title="Executable HTML preview"]');
     await expect(iframe).toBeVisible();
+    await expect(iframe).toHaveAttribute('sandbox', 'allow-scripts');
     expect((await container.boundingBox())?.height).toBeGreaterThanOrEqual(600);
     expect((await iframe.boundingBox())?.height).toBeGreaterThanOrEqual(500);
     const frame = iframe.contentFrame();
@@ -151,7 +173,16 @@ test('blob preview executes repository scripts inside sandbox', async () => {
           ),
       )
       .toBe(true);
-    await expect(frame.locator('script[src]')).toHaveCount(1);
+    await expect(frame.locator('script[src]')).toHaveCount(2);
+    await expect(frame.locator('script[src]').first()).toHaveAttribute(
+      'src',
+      /^data:application\/javascript;base64,/,
+    );
+    await expect(frame.locator('#script-result')).toHaveText('Script executed');
+    await expect(frame.locator('script[src]').last()).toHaveAttribute(
+      'src',
+      'https://external.example/analytics.js',
+    );
     await expect(frame.locator('#chart')).toHaveAttribute(
       'src',
       /^https:\/\/cdn\.jsdelivr\.net\//,
@@ -159,6 +190,14 @@ test('blob preview executes repository scripts inside sandbox', async () => {
     await expect(
       frame.locator('meta[http-equiv="Content-Security-Policy" i]'),
     ).toHaveCount(0);
+    await expect(frame.locator('link[rel~="stylesheet"]')).toHaveAttribute(
+      'href',
+      /^data:text\/css;base64,/,
+    );
+    await expect(frame.locator('#script-result')).toHaveCSS(
+      'color',
+      'rgb(1, 2, 3)',
+    );
     await page.getByRole('button', { name: 'Code' }).click();
     await expect(container).toBeHidden();
     await expect(page.locator('.react-code-lines')).toBeVisible();
@@ -190,13 +229,29 @@ test('full preview executes public repository scripts only inside sandbox', asyn
     const sandboxElement = await fullPage
       .locator('iframe[title="Executable HTML preview"]')
       .elementHandle();
+    await expect(
+      fullPage.locator('iframe[title="Executable HTML preview"]'),
+    ).toHaveAttribute(
+      'sandbox',
+      'allow-scripts allow-forms allow-modals allow-popups allow-downloads',
+    );
     const sandbox = await sandboxElement?.contentFrame();
     expect(sandbox).not.toBeNull();
     await expect
-      .poll(() => requested.includes(`${cdnBase}/reports/weekly/app.js`))
+      .poll(() => requested.includes(`${rawBase}/reports/weekly/app.js`))
+      .toBe(true);
+    await expect
+      .poll(() => requested.includes('https://external.example/analytics.js'))
       .toBe(true);
     await expect.poll(() => browserErrors).toEqual([]);
     await expect(sandbox!.locator('#script-result')).toHaveText('Script executed');
+    await expect(sandbox!.locator('#external-result')).toHaveText(
+      'External script executed',
+    );
+    await expect(sandbox!.locator('#script-result')).toHaveCSS(
+      'color',
+      'rgb(1, 2, 3)',
+    );
     expect(
       await sandbox!.evaluate(
         () =>
@@ -217,6 +272,39 @@ test('full preview executes public repository scripts only inside sandbox', asyn
         }
       }),
     ).toBe('blocked');
+  } finally {
+    await context.close();
+  }
+});
+
+test('partial blob preview exposes actionable resource diagnostics', async () => {
+  const { context, page } = await launchWithExtension();
+  try {
+    await routeProductFixtures(
+      context,
+      '<!doctype html><html><head><link rel="stylesheet" href="./missing.css"></head><body><h1 id="partial-content">Usable content</h1></body></html>',
+    );
+    await page.goto(blobUrl, { waitUntil: 'domcontentloaded' });
+    await page.getByRole('tab', { name: 'Preview' }).click();
+
+    const container = page.locator('.gh-html-preview-container');
+    await expect(container.getByRole('status')).toContainText(
+      'resource issues',
+    );
+    await expect(
+      container.getByText('View resource issues'),
+    ).toBeVisible();
+    await container.getByText('View resource issues').click();
+    await expect(container).toContainText('missing.css');
+    await expect(
+      container.getByRole('button', { name: 'Copy diagnostics' }),
+    ).toBeVisible();
+    await expect(
+      container
+        .locator('iframe[title="Executable HTML preview"]')
+        .contentFrame()
+        .locator('#partial-content'),
+    ).toHaveText('Usable content');
   } finally {
     await context.close();
   }
@@ -260,12 +348,13 @@ test('fork PR gets one preview link for exact head repository and commit', async
         });
         return;
       }
-      await route.continue();
+      if (url.startsWith('chrome-extension://')) await route.continue();
+      else await route.abort('blockedbyclient');
     });
 
     await page.goto(prUrl, { waitUntil: 'domcontentloaded' });
     const previewLink = page.getByRole('link', {
-      name: 'Open full preview for examples/demo.html',
+      name: 'Open after preview for examples/demo.html in new tab',
     });
     await expect(previewLink).toHaveCount(1);
     const href = await previewLink.getAttribute('href');
@@ -277,13 +366,25 @@ test('fork PR gets one preview link for exact head repository and commit', async
       ref: forkSha,
       path: 'examples/demo.html',
     });
+    const prPreviewPromise = context.waitForEvent('page');
+    await previewLink.click();
+    const prPreview = await prPreviewPromise;
+    await expect(prPreview.getByRole('status')).toHaveText(
+      'Executable preview ready.',
+    );
+    await expect(
+      prPreview
+        .locator('iframe[title="Executable HTML preview"]')
+        .contentFrame()
+        .locator('#rich-pr'),
+    ).toHaveText('Rich PR HTML');
 
     const htmlDiff = page.locator('.file[data-path="examples/demo.html"]');
-    const richButton = htmlDiff.getByRole('button', {
-      name: 'Display the rendered PR head',
+    const richButton = htmlDiff.getByRole('tab', {
+      name: 'Display after preview',
     });
-    const sourceButton = htmlDiff.getByRole('button', {
-      name: 'Display the source diff',
+    const sourceButton = htmlDiff.getByRole('tab', {
+      name: 'Display code diff',
     });
     await expect(richButton).toHaveClass(/BtnGroup-item/);
     await richButton.click();
@@ -314,14 +415,14 @@ test('fork PR gets one preview link for exact head repository and commit', async
     await expect(previewLink).toHaveCount(1);
     await expect(
       page.getByRole('link', {
-        name: 'Open full preview for examples/late.htm',
+        name: 'Open after preview for examples/late.htm in new tab',
       }),
     ).toHaveCount(1);
     await expect(
       page
         .locator('.file[data-path="examples/late.htm"]')
-        .getByRole('button', {
-          name: 'Display synchronized before and after previews',
+        .getByRole('tab', {
+          name: 'Display before and after previews',
         }),
     ).toHaveCount(1);
     expect(apiRequests).toBe(0);
@@ -392,21 +493,38 @@ test('authenticated changes DOM receives HTML source and rich diff controls', as
         });
         return;
       }
-      await route.continue();
+      if (url.startsWith('chrome-extension://')) await route.continue();
+      else await route.abort('blockedbyclient');
     });
 
     await page.goto(prUrl, { waitUntil: 'domcontentloaded' });
     const region = page.locator('[role="region"][id^="diff-"]');
     await expect(
+      page.getByRole('navigation', {
+        name: 'HTML files in this pull request',
+      }),
+    ).toContainText(filePath);
+    await expect(
       region.getByRole('link', {
-        name: `Open full preview for ${filePath}`,
+        name: `Open after preview for ${filePath} in new tab`,
       }),
     ).toBeVisible();
-    const richButton = region.getByRole('button', {
-      name: 'Display synchronized before and after previews',
+    const richButton = region.getByRole('tab', {
+      name: 'Display before and after previews',
     });
     await expect(richButton).toBeVisible();
+    const sourceButton = region.getByRole('tab', {
+      name: 'Display code diff',
+    });
+    const afterButton = region.getByRole('tab', {
+      name: 'Display after preview',
+    });
+    await expect(sourceButton).toHaveAttribute('aria-selected', 'true');
+    await expect(richButton).toHaveAttribute('aria-selected', 'false');
+    await expect(afterButton).toHaveAttribute('aria-selected', 'false');
     await richButton.click();
+    await expect(richButton).toHaveAttribute('aria-selected', 'true');
+    await expect(sourceButton).toHaveAttribute('aria-selected', 'false');
     const richContainer = region.locator('.gh-html-preview-pr-rich');
     await expect(richContainer.getByRole('status')).toHaveText(
       'Before and after ready',
@@ -429,6 +547,16 @@ test('authenticated changes DOM receives HTML source and rich diff controls', as
     await expect(afterFrame.locator('#after-script')).toHaveText(
       'After script ran',
     );
+    await expect(
+      richContainer.getByRole('link', { name: 'Open preview' }),
+    ).toHaveCount(2);
+    await expect(
+      richContainer.getByRole('link', { name: 'View source' }),
+    ).toHaveCount(2);
+    await expect(
+      richContainer.getByRole('button', { name: 'Copy preview URL' }),
+    ).toHaveCount(2);
+    await expect(richContainer.getByText('Resources')).toHaveCount(2);
     const beforeHandle = await beforeIframe.elementHandle();
     const afterHandle = await afterIframe.elementHandle();
     const beforePageFrame = await beforeHandle?.contentFrame();
@@ -457,16 +585,73 @@ test('authenticated changes DOM receives HTML source and rich diff controls', as
     await richContainer
       .getByRole('checkbox', { name: 'Synchronize preview scrolling' })
       .uncheck();
+    await expect(
+      richContainer.getByRole('checkbox', {
+        name: 'Synchronize preview scrolling',
+      }),
+    ).not.toBeChecked();
     const unsyncedY = await afterPageFrame!.evaluate(() => scrollY);
     await beforePageFrame!.evaluate(() => scrollTo(0, 0));
     await delay(200);
     expect(await afterPageFrame!.evaluate(() => scrollY)).toBe(unsyncedY);
-
     await richContainer
-      .getByRole('combobox', { name: 'Preview viewport width' })
-      .selectOption('390');
+      .getByRole('checkbox', { name: 'Synchronize preview scrolling' })
+      .check();
+    await beforePageFrame!.evaluate(() => scrollTo(0, 2000));
+    await expect
+      .poll(() => afterPageFrame!.evaluate(() => scrollY))
+      .toBeGreaterThan(1000);
+
+    const viewport = richContainer.getByRole('combobox', {
+      name: 'Preview viewport width',
+    });
+    await richContainer.evaluate((element) => {
+      element.style.width = '2700px';
+    });
+    await viewport.selectOption('1280');
+    await expect(viewport).toHaveValue('1280');
+    expect((await beforeIframe.boundingBox())?.width).toBeGreaterThanOrEqual(
+      1275,
+    );
+    expect((await afterIframe.boundingBox())?.width).toBeGreaterThanOrEqual(
+      1275,
+    );
+    await viewport.selectOption('768');
+    await expect(viewport).toHaveValue('768');
+    expect((await beforeIframe.boundingBox())?.width).toBeLessThanOrEqual(768);
+    expect((await afterIframe.boundingBox())?.width).toBeLessThanOrEqual(768);
+    await viewport.selectOption('390');
+    await expect(viewport).toHaveValue('390');
+    await expect(richContainer.getByText(/Effective width · \d+ px/)).toBeVisible();
     expect((await beforeIframe.boundingBox())?.width).toBeLessThanOrEqual(390);
     expect((await afterIframe.boundingBox())?.width).toBeLessThanOrEqual(390);
+
+    const overlay = richContainer.getByRole('checkbox', {
+      name: 'Overlay before and after previews',
+    });
+    await overlay.check();
+    await expect(
+      richContainer.getByRole('slider', {
+        name: 'After preview overlay opacity',
+      }),
+    ).toBeVisible();
+    await expect(afterIframe.locator('..').locator('..')).toHaveCSS(
+      'opacity',
+      '0.5',
+    );
+    await overlay.uncheck();
+
+    await richContainer.evaluate((element) => {
+      (element as HTMLElement).style.width = '800px';
+    });
+    await expect(richContainer.getByText('Stacked layout')).toBeVisible();
+    await richContainer.evaluate((element) => {
+      (element as HTMLElement).style.width = '3000px';
+    });
+    await viewport.selectOption('responsive');
+    await expect(viewport).toHaveValue('responsive');
+    expect((await beforeIframe.boundingBox())?.width).toBeGreaterThan(1280);
+    expect((await afterIframe.boundingBox())?.width).toBeGreaterThan(1280);
 
     await beforeIframe.evaluate((iframe) => {
       iframe.closest('section')?.style.setProperty('display', 'none');
@@ -486,9 +671,9 @@ test('authenticated changes DOM receives HTML source and rich diff controls', as
     expect(baseFileRequests).toBe(2);
     expect(headFileRequests).toBe(2);
 
-    await region
-      .getByRole('button', { name: 'Display the rendered PR head' })
-      .click();
+    await afterButton.click();
+    await expect(afterButton).toHaveAttribute('aria-selected', 'true');
+    await expect(richButton).toHaveAttribute('aria-selected', 'false');
     await expect(beforeIframe).toBeHidden();
     await expect(afterIframe).toBeVisible();
     await expect(
@@ -504,14 +689,17 @@ test('authenticated changes DOM receives HTML source and rich diff controls', as
         ),
       )
       .toBe(true);
+    await expect(
+      richContainer.getByRole('button', { name: 'Exit full screen' }),
+    ).toBeVisible();
     await page.evaluate(() => document.exitFullscreen());
     await expect
       .poll(() => page.evaluate(() => document.fullscreenElement === null))
       .toBe(true);
     await expect(region.locator('.border')).toBeHidden();
-    await region
-      .getByRole('button', { name: 'Display the source diff' })
-      .click();
+    await sourceButton.click();
+    await expect(sourceButton).toHaveAttribute('aria-selected', 'true');
+    await expect(afterButton).toHaveAttribute('aria-selected', 'false');
     await expect(region.locator('.border')).toBeVisible();
     expect(apiRequests).toBe(1);
   } finally {
@@ -555,6 +743,17 @@ test('split comparison represents an added HTML file without failing head previe
       }
       if (
         url ===
+        'https://api.github.com/repos/acme/reports/pulls/44/files?per_page=100'
+      ) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify([{ filename: filePath, status: 'added' }]),
+        });
+        return;
+      }
+      if (
+        url ===
         `https://raw.githubusercontent.com/acme/reports/${baseSha}/${filePath}`
       ) {
         await route.fulfill({ status: 404, body: 'missing' });
@@ -571,14 +770,15 @@ test('split comparison represents an added HTML file without failing head previe
         });
         return;
       }
-      await route.continue();
+      if (url.startsWith('chrome-extension://')) await route.continue();
+      else await route.abort('blockedbyclient');
     });
 
     await page.goto(prUrl, { waitUntil: 'domcontentloaded' });
     const region = page.locator('[role="region"][id^="diff-"]');
     await region
-      .getByRole('button', {
-        name: 'Display synchronized before and after previews',
+      .getByRole('tab', {
+        name: 'Display before and after previews',
       })
       .click();
     const comparison = region.locator('.gh-html-preview-pr-rich');
@@ -586,12 +786,228 @@ test('split comparison represents an added HTML file without failing head previe
       'Comparison partial',
     );
     await expect(comparison).toContainText(
-      'Base version unavailable. File may have been added.',
+      'File was added in this pull request; no Before version exists.',
     );
     const after = comparison
       .locator(`iframe[title="After HTML preview for ${filePath}"]`)
       .contentFrame();
     await expect(after.locator('#added-head')).toHaveText('Added file');
+  } finally {
+    await context.close();
+  }
+});
+
+test('split comparison resolves renamed base paths and deleted head states', async () => {
+  const { context, page } = await launchWithExtension();
+  const baseSha = '1111111111111111111111111111111111111111';
+  const headSha = '2222222222222222222222222222222222222222';
+  const renamedPath = 'examples/new-name.html';
+  const previousPath = 'examples/old-name.html';
+  const deletedPath = 'examples/deleted.html';
+  const renamedUrl = 'https://github.com/acme/reports/pull/47/changes';
+  const deletedUrl = 'https://github.com/acme/reports/pull/48/changes';
+  try {
+    await context.route('**/*', async (route) => {
+      const url = route.request().url();
+      if (url === renamedUrl) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: githubReactPrFixture(renamedPath),
+        });
+        return;
+      }
+      if (url === deletedUrl) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: githubReactPrFixture(deletedPath),
+        });
+        return;
+      }
+      if (
+        url === 'https://api.github.com/repos/acme/reports/pulls/47' ||
+        url === 'https://api.github.com/repos/acme/reports/pulls/48'
+      ) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            base: {
+              sha: baseSha,
+              repo: { full_name: 'acme/reports', private: false },
+            },
+            head: {
+              sha: headSha,
+              repo: { full_name: 'acme/reports', private: false },
+            },
+          }),
+        });
+        return;
+      }
+      if (
+        url ===
+        'https://api.github.com/repos/acme/reports/pulls/47/files?per_page=100'
+      ) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify([
+            {
+              filename: renamedPath,
+              previous_filename: previousPath,
+              status: 'renamed',
+            },
+          ]),
+        });
+        return;
+      }
+      if (
+        url ===
+        'https://api.github.com/repos/acme/reports/pulls/48/files?per_page=100'
+      ) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify([{ filename: deletedPath, status: 'removed' }]),
+        });
+        return;
+      }
+      if (
+        url ===
+        `https://raw.githubusercontent.com/acme/reports/${baseSha}/${renamedPath}`
+      ) {
+        await route.fulfill({ status: 404, body: 'renamed' });
+        return;
+      }
+      if (
+        url ===
+        `https://raw.githubusercontent.com/acme/reports/${baseSha}/${previousPath}`
+      ) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: '<h1 id="renamed-before">Old name</h1>',
+        });
+        return;
+      }
+      if (
+        url ===
+        `https://raw.githubusercontent.com/acme/reports/${headSha}/${renamedPath}`
+      ) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: '<h1 id="renamed-after">New name</h1>',
+        });
+        return;
+      }
+      if (
+        url ===
+        `https://raw.githubusercontent.com/acme/reports/${baseSha}/${deletedPath}`
+      ) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: '<h1 id="deleted-before">Deleted file</h1>',
+        });
+        return;
+      }
+      if (
+        url ===
+        `https://raw.githubusercontent.com/acme/reports/${headSha}/${deletedPath}`
+      ) {
+        await route.fulfill({ status: 404, body: 'deleted' });
+        return;
+      }
+      if (url.startsWith('chrome-extension://')) await route.continue();
+      else await route.abort('blockedbyclient');
+    });
+
+    await page.goto(renamedUrl, { waitUntil: 'domcontentloaded' });
+    let region = page.locator('[role="region"][id^="diff-"]');
+    await region
+      .getByRole('tab', { name: 'Display before and after previews' })
+      .click();
+    let comparison = region.locator('.gh-html-preview-pr-rich');
+    await expect(comparison.getByRole('status')).toHaveText(
+      'Before and after ready',
+    );
+    await expect(
+      comparison
+        .locator(`iframe[title="Before HTML preview for ${renamedPath}"]`)
+        .contentFrame()
+        .locator('#renamed-before'),
+    ).toHaveText('Old name');
+    await expect(comparison).toContainText(previousPath);
+
+    const deletedPage = await context.newPage();
+    await deletedPage.goto(deletedUrl, { waitUntil: 'domcontentloaded' });
+    region = deletedPage.locator('[role="region"][id^="diff-"]');
+    await region
+      .getByRole('tab', { name: 'Display before and after previews' })
+      .click();
+    comparison = region.locator('.gh-html-preview-pr-rich');
+    await expect(comparison.getByRole('status')).toHaveText(
+      'Comparison partial',
+    );
+    await expect(comparison).toContainText(
+      'File was deleted in this pull request; no After version exists.',
+    );
+    await expect(
+      comparison
+        .locator(`iframe[title="Before HTML preview for ${deletedPath}"]`)
+        .contentFrame()
+        .locator('#deleted-before'),
+    ).toHaveText('Deleted file');
+  } finally {
+    await context.close();
+  }
+});
+
+test('PR metadata failure leaves the source diff recoverable', async () => {
+  const { context, page } = await launchWithExtension();
+  const prUrl = 'https://github.com/acme/reports/pull/45/changes';
+  const filePath = 'examples/unavailable.html';
+  try {
+    await context.route('**/*', async (route) => {
+      const url = route.request().url();
+      if (url === prUrl) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: githubReactPrFixture(filePath),
+        });
+        return;
+      }
+      if (url === 'https://api.github.com/repos/acme/reports/pulls/45') {
+        await route.fulfill({ status: 503, body: 'unavailable' });
+        return;
+      }
+      if (url.startsWith('chrome-extension://')) await route.continue();
+      else await route.abort('blockedbyclient');
+    });
+
+    await page.goto(prUrl, { waitUntil: 'domcontentloaded' });
+    const region = page.locator('[role="region"][id^="diff-"]');
+    const source = region.getByRole('tab', {
+      name: 'Display code diff',
+    });
+    await region
+      .getByRole('tab', {
+        name: 'Display before and after previews',
+      })
+      .click();
+    const comparison = region.locator('.gh-html-preview-pr-rich');
+    await expect(comparison.getByRole('status')).toHaveText(
+      'Error: GitHub API returned HTTP 503',
+    );
+    await expect(comparison.locator('iframe')).toHaveCount(0);
+
+    await source.click();
+    await expect(source).toHaveAttribute('aria-selected', 'true');
+    await expect(comparison).toBeHidden();
+    await expect(region.locator('.border')).toBeVisible();
   } finally {
     await context.close();
   }
@@ -612,7 +1028,7 @@ test('SPA navigation renders only the newly selected file', async () => {
     await page.getByRole('tab', { name: 'Preview' }).click();
     await expect(
       page.locator('.gh-html-preview-container').getByRole('status'),
-    ).toHaveText('Ready');
+    ).toHaveText('Executable preview ready');
 
     await page.evaluate(
       ({ url, html }) => {
@@ -636,7 +1052,7 @@ test('SPA navigation renders only the newly selected file', async () => {
     await expect(nextPreview).toHaveCount(1);
     await nextPreview.click();
     const frame = page
-      .locator('.gh-html-preview-container iframe[title="Static HTML preview"]')
+      .locator('.gh-html-preview-container iframe[title="Executable HTML preview"]')
       .contentFrame();
     await expect(frame.locator('#file-b')).toHaveText('File B');
     await expect(frame.locator('#file-a')).toHaveCount(0);
@@ -654,7 +1070,9 @@ test('popup enable setting updates an already-open GitHub page', async () => {
 
     const popup = await context.newPage();
     await popup.goto(`chrome-extension://${extensionId}/popup.html`);
-    const enabled = popup.getByRole('checkbox', { name: 'Enable extension' });
+    const enabled = popup.getByRole('checkbox', {
+      name: 'Show previews on GitHub HTML files and pull requests',
+    });
     await expect(enabled).toBeChecked();
     await enabled.uncheck();
     await expect(popup.getByRole('status')).toHaveText('Saved');
@@ -671,9 +1089,19 @@ test('popup enable setting updates an already-open GitHub page', async () => {
 
 test('missing embedded source produces recoverable inline error', async () => {
   const { context, page } = await launchWithExtension();
+  let attempts = 0;
   try {
     await context.route(`${rawBase}/reports/weekly/index.html`, async (route) => {
-      await route.fulfill({ status: 503, body: 'unavailable' });
+      attempts += 1;
+      await route.fulfill(
+        attempts === 1
+          ? { status: 503, body: 'unavailable' }
+          : {
+              status: 200,
+              contentType: 'text/html',
+              body: '<h1 id="retry-success">Retry succeeded</h1>',
+            },
+      );
     });
     await context.route(blobUrl, async (route) => {
       await route.fulfill({
@@ -686,9 +1114,19 @@ test('missing embedded source produces recoverable inline error', async () => {
     await page.getByRole('tab', { name: 'Preview' }).click();
 
     const container = page.locator('.gh-html-preview-container');
-    await expect(container.getByRole('status')).toHaveText('Error');
+    await expect(container.getByRole('alert')).toHaveText('Error');
     await expect(container).toContainText('Public raw file returned HTTP 503');
     await expect(container).toContainText('Preview could not be rendered');
+    await container.getByRole('button', { name: 'Retry' }).click();
+    await expect(container.getByRole('status')).toHaveText(
+      'Executable preview ready',
+    );
+    await expect(
+      container
+        .locator('iframe[title="Executable HTML preview"]')
+        .contentFrame()
+        .locator('#retry-success'),
+    ).toHaveText('Retry succeeded');
     await page.getByRole('button', { name: 'Code' }).click();
     await expect(page.locator('.react-code-lines')).toBeVisible();
   } finally {
@@ -717,9 +1155,11 @@ test('inline preview falls back to public raw source when embedded HTML is absen
     await page.getByRole('tab', { name: 'Preview' }).click();
 
     const container = page.locator('.gh-html-preview-container');
-    await expect(container.getByRole('status')).toHaveText('Ready');
+    await expect(container.getByRole('status')).toHaveText(
+      'Executable preview ready',
+    );
     const frame = container
-      .locator('iframe[title="Static HTML preview"]')
+      .locator('iframe[title="Executable HTML preview"]')
       .contentFrame();
     await expect(frame.locator('#fallback')).toHaveText('Fallback source');
   } finally {
@@ -832,7 +1272,7 @@ test('private blob and executable preview use local token without exposing it', 
     await page.goto(privateBlobUrl, { waitUntil: 'domcontentloaded' });
     await page.getByRole('tab', { name: 'Preview' }).click();
     const container = page.locator('.gh-html-preview-container');
-    await expect(container.getByRole('status')).toHaveText('Error');
+    await expect(container.getByRole('alert')).toHaveText('Error');
     await expect(container).toContainText(
       'Private repository access requires a fine-grained GitHub token',
     );
@@ -857,15 +1297,26 @@ test('private blob and executable preview use local token without exposing it', 
       metadata: 'read',
       pull_requests: 'read',
     });
-    await popup.getByLabel('Private repository access').fill(privateToken);
+    const tokenInput = popup.getByLabel('Private repository access');
+    const saveToken = popup.getByRole('button', { name: 'Save token' });
+    await saveToken.click();
+    await expect(popup.getByRole('alert')).toHaveText(
+      'Enter a fine-grained GitHub token.',
+    );
+    await tokenInput.fill(`  ${privateToken}  `);
     await popup.getByRole('button', { name: 'Save token' }).click();
     await expect(popup.getByRole('status')).toContainText(
-      'Private access saved',
+      'Token saved',
     );
+    await expect(tokenInput).toHaveCount(0);
+    await expect(popup.getByRole('button', { name: 'Replace' })).toBeVisible();
+    await expect(popup.getByRole('button', { name: 'Remove' })).toBeEnabled();
 
-    await expect(container.getByRole('status')).toHaveText('Ready');
+    await expect(container.getByRole('status')).toHaveText(
+      'Executable preview ready',
+    );
     const staticFrame = container
-      .locator('iframe[title="Static HTML preview"]')
+      .locator('iframe[title="Executable HTML preview"]')
       .contentFrame();
     await expect(staticFrame.locator('#private-title')).toHaveText(
       'Private report',
@@ -931,7 +1382,7 @@ test('private blob and executable preview use local token without exposing it', 
     const prPage = await context.newPage();
     await prPage.goto(privatePrUrl, { waitUntil: 'domcontentloaded' });
     const privatePrLink = prPage.getByRole('link', {
-      name: 'Open full preview for report/index.html',
+      name: 'Open after preview for report/index.html in new tab',
     });
     await expect(privatePrLink).toBeVisible();
     const privatePrQuery = new URL(
@@ -951,8 +1402,8 @@ test('private blob and executable preview use local token without exposing it', 
       '.file[data-path="report/index.html"]',
     );
     await privateDiff
-      .getByRole('button', {
-        name: 'Display synchronized before and after previews',
+      .getByRole('tab', {
+        name: 'Display before and after previews',
       })
       .click();
     const privateComparison = privateDiff.locator(
@@ -973,6 +1424,17 @@ test('private blob and executable preview use local token without exposing it', 
         .contentFrame()
         .locator('#private-title'),
     ).toHaveText('Private report');
+
+    await popup.getByRole('button', { name: 'Remove' }).click();
+    await expect(popup.getByRole('status')).toHaveText(
+      'Private access removed.',
+    );
+    await expect(tokenInput).toHaveValue('');
+    await expect(popup.getByRole('button', { name: 'Remove' })).toBeDisabled();
+    await expect(container.getByRole('alert')).toHaveText('Error');
+    await expect(container).toContainText(
+      'Private repository access requires a fine-grained GitHub token',
+    );
   } finally {
     await context.close();
   }

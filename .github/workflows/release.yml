@@ -41,6 +41,9 @@ jobs:
       - name: Run deterministic extension E2E
         run: pnpm run test:e2e
 
+      - name: Verify release version contract
+        run: node scripts/verify-release-version.mjs "$GITHUB_REF_NAME"
+
       - name: Build stable release archive
         if: ${{ !contains(github.ref_name, '-') }}
         run: pnpm run zip
@@ -51,6 +54,27 @@ jobs:
           pnpm run zip:debug
           mv .output/github-html-preview-*-chrome.zip \
             ".output/github-html-preview-${GITHUB_REF_NAME#v}-chrome.zip"
+
+      - name: Install exact release archive
+        run: |
+          rm -rf .artifact-extension
+          mkdir .artifact-extension
+          unzip -q .output/*-chrome.zip -d .artifact-extension
+
+      - name: Smoke exact release archive
+        env:
+          EXTENSION_PATH: ${{ github.workspace }}/.artifact-extension
+        run: pnpm exec playwright test --grep "blob preview embeds"
+
+      - name: Upload release diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-playwright-diagnostics
+          path: |
+            test-results/
+            playwright-report/
+          if-no-files-found: ignore
 
       - name: Publish stable GitHub release
         if: ${{ !contains(github.ref_name, '-') }}

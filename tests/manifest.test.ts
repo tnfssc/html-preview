@@ -10,8 +10,21 @@ interface Manifest {
   host_permissions?: string[];
   background?: unknown;
   sandbox?: { pages?: string[] };
+  web_accessible_resources?: Array<{
+    resources?: string[];
+    matches?: string[];
+    use_dynamic_url?: boolean;
+  }>;
+  content_security_policy?: {
+    extension_pages?: string;
+    sandbox?: string;
+  };
   action?: { default_title?: string; default_popup?: string };
-  content_scripts?: Array<{ js?: string[] }>;
+  content_scripts?: Array<{
+    js?: string[];
+    matches?: string[];
+    run_at?: string;
+  }>;
 }
 
 async function readManifest(): Promise<Manifest> {
@@ -33,14 +46,46 @@ describe('packaged Chrome extension', () => {
     ]);
   });
 
-  it('registers blob, PR, popup, and sandbox entrypoints', async () => {
+  it('scopes preview access to GitHub and gives each sandbox capability a purpose', async () => {
     const manifest = await readManifest();
-    const scripts = manifest.content_scripts?.flatMap((entry) => entry.js ?? []);
-    expect(scripts).toEqual([
-      'content-scripts/content.js',
-      'content-scripts/pr.js',
+
+    expect(manifest.web_accessible_resources).toEqual([
+      {
+        resources: ['preview.html', 'sandbox.html'],
+        matches: ['*://github.com/*'],
+        use_dynamic_url: true,
+      },
     ]);
     expect(manifest.sandbox?.pages).toEqual(['sandbox.html']);
+    expect(manifest.content_security_policy?.extension_pages).toContain(
+      "default-src 'self'",
+    );
+    expect(manifest.content_security_policy?.extension_pages).toContain(
+      "connect-src https://api.github.com https://raw.githubusercontent.com https://cdn.jsdelivr.net",
+    );
+    expect(manifest.content_security_policy?.extension_pages).toContain(
+      "script-src 'self'",
+    );
+    expect(manifest.content_security_policy?.sandbox).toContain(
+      'sandbox allow-scripts allow-forms allow-modals allow-popups allow-downloads',
+    );
+    expect(manifest.content_security_policy?.sandbox).toContain(
+      'script-src \'self\' \'unsafe-inline\' \'unsafe-eval\' data: blob: https: http:',
+    );
+    expect(manifest.content_security_policy?.sandbox).toContain(
+      'connect-src data: blob: https: http:',
+    );
+  });
+
+  it('registers GitHub document-end, popup, and sandbox entrypoints', async () => {
+    const manifest = await readManifest();
+    expect(manifest.content_scripts).toEqual([
+      {
+        matches: ['*://github.com/*'],
+        run_at: 'document_end',
+        js: ['content-scripts/content.js', 'content-scripts/pr.js'],
+      },
+    ]);
     expect(manifest.action).toEqual({
       default_title: 'GitHub HTML Preview',
       default_popup: 'popup.html',

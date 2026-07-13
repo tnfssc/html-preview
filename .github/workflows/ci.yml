@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm run compile
+      - run: pnpm test
+      - run: pnpm run test:e2e
+      - name: Build stable archive
+        run: pnpm run zip
+      - name: Install exact stable archive
+        run: |
+          rm -rf .artifact-extension
+          mkdir .artifact-extension
+          unzip -q .output/github-html-preview-*-chrome.zip -d .artifact-extension
+      - name: Smoke exact stable archive
+        env:
+          EXTENSION_PATH: ${{ github.workspace }}/.artifact-extension
+        run: pnpm exec playwright test --grep "blob preview embeds"
+      - name: Upload browser diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-diagnostics
+          path: |
+            test-results/
+            playwright-report/
+          if-no-files-found: ignore
+      - name: Upload stable archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrome-stable-archive
+          path: .output/*-chrome.zip
+
+  debug-artifact:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm run zip:debug
+      - name: Install exact debug archive
+        run: |
+          rm -rf .artifact-extension-debug
+          mkdir .artifact-extension-debug
+          unzip -q .output/github-html-preview-*-chrome.zip -d .artifact-extension-debug
+      - name: Smoke exact debug archive
+        env:
+          EXTENSION_PATH: ${{ github.workspace }}/.artifact-extension-debug
+        run: pnpm exec playwright test --grep "blob preview embeds"
+      - name: Upload browser diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-debug-diagnostics
+          path: |
+            test-results/
+            playwright-report/
+          if-no-files-found: ignore
+      - name: Upload debug archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrome-debug-archive
+          path: .output/*-chrome.zip

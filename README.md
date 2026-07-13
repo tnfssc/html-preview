@@ -1,16 +1,16 @@
 # GitHub HTML Preview
 
-Chrome extension for previewing public and private `.html` and `.htm` files on GitHub.
+Chrome extension for running and comparing commit-pinned public and private `.html` and `.htm` files directly on GitHub.
 
 ## Product behavior
 
-- Blob pages get a **Preview** tab beside GitHub's file controls.
-- Inline previews are static: scripts, forms, embeds, external navigation, and external network requests are blocked. Repository CSS, images, fonts, and media are fetched and embedded locally.
-- **Open full preview** runs repository HTML and JavaScript in a manifest sandbox with no extension API or parent-page access.
-- Pull-request file views get **Source**, synchronized **Split**, and rendered **After** controls for changed HTML files, plus **Preview HTML** for a full-page sandbox. Split mode renders base and head commits with linked vertical/horizontal scrolling, responsive width presets, reload, and full-screen comparison. Fork PRs resolve each side against its exact repository and commit.
+- Blob pages get a **Preview** tab beside GitHub's file controls. Repository scripts run in an isolated executable frame; repository CSS and module graphs are packaged against the exact commit.
+- Preview headers disclose **Executable · Scripts and network access on**. Preview code cannot access extension APIs, GitHub's parent DOM, or extension storage, but it can communicate with external services.
+- **Open full preview** opens the same commit-pinned document in a dedicated executable sandbox.
+- Pull-request file views get **Code diff**, **Before & after**, and **After preview** views plus **Open after preview**. Before/after uses exact base and head repositories and commits, including forks.
+- Comparison tools include synchronized horizontal/vertical scrolling, Fit/Desktop/Tablet/Mobile widths, reload, fullscreen, and partial-side handling for added or deleted files.
 - Public repositories need no credentials.
-- Private access uses an optional fine-grained GitHub token stored only in `chrome.storage.local`. Give it read-only **Contents**, **Metadata**, and **Pull requests** access for selected repositories.
-- Executable private previews require a separate explicit opt-in because repository scripts can transmit private content to external servers.
+- Private access uses an optional fine-grained GitHub token stored in `chrome.storage.local`. Give it read-only **Contents**, **Metadata**, and **Pull requests** access only for selected repositories.
 - Tokens are sent only as `Authorization` headers to `https://api.github.com`; they are never placed in URLs, preview HTML, logs, or release artifacts.
 
 ## Development
@@ -23,10 +23,11 @@ pnpm run test:e2e
 pnpm run test:smoke
 pnpm run build
 pnpm run build:debug
+pnpm run zip
 pnpm run zip:debug
 ```
 
-- `pnpm test`: resolver, security, resource-limit, and packaged-manifest contracts.
+- `pnpm test`: resolver, GitHub API, resource-limit, and packaged-manifest contracts.
 - `pnpm run test:e2e`: deterministic Chromium extension workflows with mocked GitHub pages and assets.
 - `pnpm run test:smoke`: live checks against current GitHub blob and pull-request DOM.
 
@@ -38,8 +39,10 @@ Debug builds output to `.output/chrome-mv3-debug/`. Reproduce problems with GitH
 [gh-html-preview:debug]
 ```
 
-Diagnostic logs include lifecycle events, repository paths, HTTP status, resource counts, and failures. They exclude tokens and file contents.
+Diagnostic logs include lifecycle events, repository paths, HTTP status, resource counts, timings, and failures. They exclude tokens and file contents.
 
-## Security boundary
+## Execution boundary
 
-Privileged extension pages handle packaged code, local settings, and authenticated GitHub API requests. Executable repository content runs only in `sandbox.html`, which cannot access extension APIs or parent DOM. Inline previews carry a deny-by-default document CSP and use only embedded `data:` resources. Private CSS, images, scripts, and module graphs are fetched in the privileged context and packaged as data URLs before entering the sandbox.
+Privileged extension contexts handle local settings, authenticated GitHub API requests, and repository packaging. Executable repository content runs in `sandbox.html` with an opaque origin and without `allow-same-origin`. It cannot access extension APIs, extension storage, GitHub cookies, or the parent DOM.
+
+Public and private repository resources are fetched at exact refs before sandbox delivery. Private resources become token-free data URLs. External resources remain external, and preview scripts can send rendered data to external services. Only preview code you trust.

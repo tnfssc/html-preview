@@ -9,6 +9,21 @@ export const githubTokenStorage = storage.defineItem<string | null>(
   { fallback: null },
 );
 
+export interface ComparisonPreferences {
+  mode: 'source' | 'split' | 'after';
+  viewport: 'responsive' | '1280' | '768' | '390';
+  syncScroll: boolean;
+}
+
+export const comparisonPreferencesStorage =
+  storage.defineItem<ComparisonPreferences>('local:comparisonPreferences', {
+    fallback: {
+      mode: 'source',
+      viewport: 'responsive',
+      syncScroll: true,
+    },
+  });
+
 export async function getSettings(): Promise<{
   enabled: boolean;
   githubToken: string | null;

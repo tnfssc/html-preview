@@ -12,7 +12,7 @@ export function debugLog(
     at: new Date().toISOString(),
     scope,
     event,
-    ...details,
+    ...redactDetails(details),
   });
 }
 
@@ -29,8 +29,25 @@ export function debugError(
     event,
     error:
       error instanceof Error
-        ? `${error.name}: ${error.message}`
-        : String(error),
-    ...details,
+        ? redactDebugText(`${error.name}: ${error.message}`)
+        : redactDebugText(String(error)),
+    ...redactDetails(details),
   });
+}
+
+export function redactDebugText(value: string): string {
+  return value
+    .replace(/\b(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]{8,}\b/g, '[REDACTED]')
+    .replace(/\bBearer\s+[^\s,;]+/gi, 'Bearer [REDACTED]');
+}
+
+function redactDetails(
+  details: Record<string, DebugValue>,
+): Record<string, DebugValue> {
+  return Object.fromEntries(
+    Object.entries(details).map(([key, value]) => [
+      key,
+      typeof value === 'string' ? redactDebugText(value) : value,
+    ]),
+  );
 }

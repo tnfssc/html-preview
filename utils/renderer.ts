@@ -1,4 +1,10 @@
 import type { ResolveResult } from './types';
+import {
+  isSandboxReadyMessage,
+  postSandboxDocument,
+} from './sandboxProtocol';
+import { debugLog } from './debug';
+import { recordRenderMetrics } from './metrics';
 
 export interface RenderResult {
   iframe: HTMLIFrameElement;
@@ -17,17 +23,15 @@ export interface RenderOptions {
   onScroll?: (position: ScrollPosition) => void;
 }
 
-export function renderStaticPreview(
+export function renderExecutablePreview(
   container: HTMLElement,
   result: ResolveResult,
   options?: RenderOptions,
 ): RenderResult {
+  const startedAt = performance.now();
   const iframe = document.createElement('iframe');
-  const channel = options?.onScroll ? crypto.randomUUID() : null;
-  iframe.srcdoc = channel
-    ? '<!doctype html><html><body>Loading comparison…</body></html>'
-    : result.html;
-  iframe.title = options?.title ?? 'Static HTML preview';
+  const channel = crypto.randomUUID();
+  iframe.title = options?.title ?? 'Executable HTML preview';
   iframe.referrerPolicy = 'no-referrer';
   iframe.setAttribute('sandbox', 'allow-scripts');
   iframe.style.width = '100%';
@@ -36,19 +40,17 @@ export function renderStaticPreview(
   iframe.style.border = 'none';
   iframe.style.minHeight = '0';
   container.replaceChildren(iframe);
-  if (channel) {
-    void installScrollBridge(result.html, channel)
-      .then((html) => {
-        if (iframe.isConnected) iframe.srcdoc = html;
-      })
-      .catch(() => {
-        if (iframe.isConnected) iframe.srcdoc = result.html;
-      });
-  }
+  const htmlReady = options?.onScroll
+    ? installScrollBridge(result.html, channel).catch(() => result.html)
+    : Promise.resolve(result.html);
+  let renderSent = false;
+  iframe.src = (browser.runtime.getURL as (path: string) => string)(
+    `/sandbox.html#${new URLSearchParams({ channel }).toString()}`,
+  );
 
   const receiveScroll = (event: MessageEvent<unknown>) => {
+
     if (
-      !channel ||
       event.source !== iframe.contentWindow ||
       typeof event.data !== 'object' ||
       event.data === null ||
@@ -57,6 +59,25 @@ export function renderStaticPreview(
       return;
     }
     const data = event.data as Record<string, unknown>;
+    if (
+      isSandboxReadyMessage(data) &&
+      data.channel === channel &&
+      !renderSent
+    ) {
+      renderSent = true;
+      void htmlReady.then((html) => {
+        if (iframe.contentWindow) {
+          postSandboxDocument(iframe.contentWindow, channel, html);
+        }
+        const handshakeMs = performance.now() - startedAt;
+        debugLog('renderer', 'sandbox-render-sent', {
+          outputBytes: result.performance.outputBytes,
+          handshakeMs: Math.round(handshakeMs),
+        });
+        recordRenderMetrics(handshakeMs);
+      });
+      return;
+    }
     if (
       data.kind === 'gh-html-preview-scroll' &&
       data.channel === channel &&
@@ -69,12 +90,11 @@ export function renderStaticPreview(
       });
     }
   };
-  if (channel) window.addEventListener('message', receiveScroll);
+  window.addEventListener('message', receiveScroll);
 
   return {
     iframe,
     setScroll: (position) => {
-      if (!channel) return;
       iframe.contentWindow?.postMessage(
         {
           kind: 'gh-html-preview-set-scroll',
@@ -87,7 +107,7 @@ export function renderStaticPreview(
     },
     destroy: () => {
       window.removeEventListener('message', receiveScroll);
-      iframe.srcdoc = '';
+      iframe.src = 'about:blank';
       iframe.remove();
     },
   };

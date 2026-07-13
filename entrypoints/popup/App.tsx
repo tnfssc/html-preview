@@ -22,6 +22,9 @@ const TOKEN_CREATION_URL = `https://github.com/settings/personal-access-tokens/n
 export default function App(): React.JSX.Element {
   const [enabled, setEnabled] = useState(true);
   const [token, setToken] = useState('');
+  const [tokenConfigured, setTokenConfigured] = useState(false);
+  const [editingToken, setEditingToken] = useState(true);
+  const [savedLogin, setSavedLogin] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>('idle');
   const [message, setMessage] = useState('');
@@ -34,7 +37,9 @@ export default function App(): React.JSX.Element {
           githubTokenStorage.getValue(),
         ]);
         setEnabled(storedEnabled);
-        setToken(storedToken ?? '');
+        setToken('');
+        setTokenConfigured(Boolean(storedToken));
+        setEditingToken(!storedToken);
         setLoaded(true);
       } catch {
         setSaveState('error');
@@ -78,17 +83,24 @@ export default function App(): React.JSX.Element {
       });
       if (!response.ok) throw new Error(`GitHub returned HTTP ${response.status}.`);
       const data = (await response.json()) as unknown;
-      const login =
+      const login: string | null =
         typeof data === 'object' &&
         data !== null &&
         !Array.isArray(data) &&
         typeof (data as Record<string, unknown>).login === 'string'
-          ? (data as Record<string, unknown>).login
+          ? ((data as Record<string, unknown>).login as string)
           : null;
       await githubTokenStorage.setValue(candidate);
-      setToken(candidate);
+      setToken('');
+      setTokenConfigured(true);
+      setEditingToken(false);
+      setSavedLogin(login);
       setSaveState('saved');
-      setMessage(login ? `Private access saved for ${login}.` : 'Private access saved.');
+      setMessage(
+        login
+          ? `Token saved for @${login}. Repository access depends on repositories selected in GitHub.`
+          : 'Token saved. Repository access depends on repositories selected in GitHub.',
+      );
       debugLog('popup', 'token-validation-complete', {
         loginReturned: Boolean(login),
       });
@@ -105,6 +117,9 @@ export default function App(): React.JSX.Element {
     try {
       await githubTokenStorage.setValue(null);
       setToken('');
+      setTokenConfigured(false);
+      setEditingToken(true);
+      setSavedLogin(null);
       setSaveState('saved');
       setMessage('Private access removed.');
     } catch {
@@ -126,14 +141,22 @@ export default function App(): React.JSX.Element {
           onChange={(e) => void updateEnabled(e.target.checked)}
           disabled={!loaded || saveState === 'saving'}
         />
-        <span>Enable extension</span>
+        <span>Show previews on GitHub HTML files and pull requests</span>
       </label>
 
       <div className="section">
-        <strong>Safe inline previews</strong>
+        <strong>Executable previews</strong>
         <p>
-          Public and private HTML render without scripts or external network
-          requests.
+          HTML previews run repository scripts in isolated frames. Scripts can
+          send preview data to external services. Only preview code you trust.
+        </p>
+      </div>
+
+      <div className="section">
+        <strong>How to use</strong>
+        <p>
+          Open an .html or .htm file on GitHub and choose Preview beside Code.
+          On a pull request, choose Before &amp; after or After preview.
         </p>
       </div>
 
@@ -152,23 +175,40 @@ export default function App(): React.JSX.Element {
         >
           Create fine-grained token
         </a>
-        <input
-          id="github-token"
-          type="password"
-          value={token}
-          onChange={(event) => setToken(event.target.value)}
-          autoComplete="off"
-          placeholder="github_pat_…"
-          disabled={!loaded || saveState === 'saving'}
-        />
+        {tokenConfigured && !editingToken ? (
+          <p>
+            Token saved{savedLogin ? ` for @${savedLogin}` : ''}. Repository
+            access depends on repositories selected in GitHub.
+          </p>
+        ) : (
+          <input
+            id="github-token"
+            type="password"
+            value={token}
+            onChange={(event) => setToken(event.target.value)}
+            autoComplete="off"
+            placeholder="github_pat_…"
+            disabled={!loaded || saveState === 'saving'}
+          />
+        )}
         <div className="button-row">
-          <button type="submit" disabled={!loaded || saveState === 'saving'}>
-            Save token
-          </button>
+          {tokenConfigured && !editingToken ? (
+            <button
+              type="button"
+              onClick={() => setEditingToken(true)}
+              disabled={!loaded || saveState === 'saving'}
+            >
+              Replace
+            </button>
+          ) : (
+            <button type="submit" disabled={!loaded || saveState === 'saving'}>
+              Save token
+            </button>
+          )}
           <button
             type="button"
             onClick={() => void clearToken()}
-            disabled={!loaded || !token || saveState === 'saving'}
+            disabled={!loaded || !tokenConfigured || saveState === 'saving'}
           >
             Remove
           </button>
@@ -188,7 +228,10 @@ export default function App(): React.JSX.Element {
         </div>
       )}
 
-      <p className={`status status-${saveState}`} role="status">
+      <p
+        className={`status status-${saveState}`}
+        role={saveState === 'error' ? 'alert' : 'status'}
+      >
         {message}
       </p>
     </div>

@@ -4,7 +4,8 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const pathToExtension = path.join(__dirname, '../.output/chrome-mv3');
+const pathToExtension =
+  process.env.EXTENSION_PATH ?? path.join(__dirname, '../.output/chrome-mv3');
 
 export async function launchWithExtension(): Promise<{
   context: BrowserContext;

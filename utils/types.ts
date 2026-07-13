@@ -28,6 +28,10 @@ export interface ResolveResult {
   html: string;
   diagnostics: ResolveDiagnostic[];
   resources: ResourceStats;
+  performance: {
+    resolveMs: number;
+    outputBytes: number;
+  };
 }
 
 export interface ResolveLimits {
@@ -35,10 +39,11 @@ export interface ResolveLimits {
   maxTotalBytes: number;
   maxDepth: number;
   concurrency: number;
+  maxOutputBytes: number;
 }
 
 export interface ResolveOptions {
-  target: 'static' | 'sandbox' | 'sandbox-private';
+  target: 'sandbox' | 'sandbox-private';
   repoRef: RepoRef;
   githubToken?: string | null;
   privateRepo?: boolean;

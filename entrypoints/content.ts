@@ -4,10 +4,11 @@ import {
   parseBlobUrl,
 } from '@/utils/github';
 import { resolveHtml } from '@/utils/resolveHtml';
-import { renderStaticPreview, type RenderResult } from '@/utils/renderer';
+import { renderExecutablePreview, type RenderResult } from '@/utils/renderer';
 import { enabledStorage, githubTokenStorage } from '@/utils/storage';
 import type { BlobPageData } from '@/utils/github';
 import type { RepoRef, ResolveResult } from '@/utils/types';
+import { recordResolveMetrics } from '@/utils/metrics';
 import { debugError, debugLog } from '@/utils/debug';
 
 const PREVIEW_TAB_CLASS = 'gh-html-preview-tab';
@@ -106,12 +107,14 @@ export default defineContentScript({
       const controller = new AbortController();
       const previewId = `gh-html-preview-${routeGeneration}`;
       const { tab, button } = createPreviewTab(tabBar, previewId, showPreview);
+      button.id = `${previewId}-tab`;
       tabBar.appendChild(tab);
 
       const container = document.createElement('section');
       container.id = previewId;
       container.className = PREVIEW_CONTAINER_CLASS;
-      container.setAttribute('aria-label', 'Static HTML preview');
+      container.setAttribute('role', 'tabpanel');
+      container.setAttribute('aria-labelledby', button.id);
       container.style.cssText =
         'display:none;flex-direction:column;height:calc(100dvh - 96px);min-height:600px;border:1px solid var(--borderColor-default,#d1d9e0);border-radius:6px;overflow:hidden;background:var(--bgColor-default,#fff);';
 
@@ -128,7 +131,9 @@ export default defineContentScript({
       fullLink.textContent = 'Open full preview';
       fullLink.style.cssText =
         'color:var(--fgColor-accent,#0969da);text-decoration:none;';
-      header.append(status, fullLink);
+      const execution = document.createElement('span');
+      execution.textContent = 'Executable · Scripts and network access on';
+      header.append(status, execution, fullLink);
 
       const details = document.createElement('p');
       details.style.cssText =
@@ -138,7 +143,8 @@ export default defineContentScript({
       previewArea.style.cssText = 'flex:1;min-height:0;overflow:hidden;';
       const placeholder = document.createElement('p');
       placeholder.style.cssText = 'margin:0;padding:24px;text-align:center;';
-      placeholder.textContent = 'Select Preview to render this file safely.';
+      placeholder.textContent =
+        'Select Preview to run this HTML in an isolated frame. Scripts and network access are on.';
       previewArea.appendChild(placeholder);
       container.append(header, details, previewArea);
       blob.appendChild(container);
@@ -301,9 +307,10 @@ export default defineContentScript({
 async function ensureResolved(route: RouteState): Promise<void> {
   if (route.render || route.resolving) return route.resolving ?? Promise.resolve();
   route.status.textContent = 'Loading';
+  route.status.setAttribute('role', 'status');
   route.details.style.display = 'none';
   route.details.textContent = '';
-  route.previewArea.replaceChildren(message('Loading static preview…'));
+  route.previewArea.replaceChildren(message('Preparing executable preview…'));
 
   route.resolving = (async () => {
     try {
@@ -334,7 +341,11 @@ async function ensureResolved(route: RouteState): Promise<void> {
         signal: route.controller.signal,
       });
       route.controller.signal.throwIfAborted();
-      route.render = renderStaticPreview(route.previewArea, result);
+      recordResolveMetrics(
+        result.performance.resolveMs,
+        result.performance.outputBytes,
+      );
+      route.render = renderExecutablePreview(route.previewArea, result);
       updateResolvedStatus(route, result);
       debugLog('blob', 'resolve-complete', {
         path: route.repoRef.path,
@@ -351,9 +362,28 @@ async function ensureResolved(route: RouteState): Promise<void> {
         privateRepo: route.isPrivate,
       });
       route.status.textContent = 'Error';
+      route.status.setAttribute('role', 'alert');
       route.details.style.display = 'block';
-      route.details.textContent =
-        error instanceof Error ? error.message : 'Static preview failed.';
+      const errorMessage =
+        error instanceof Error ? error.message : 'Executable preview failed.';
+      const text = document.createElement('span');
+      text.textContent = errorMessage;
+      const retry = createActionButton('Retry', () => {
+        route.details.style.display = 'none';
+        void ensureResolved(route);
+      });
+      route.details.replaceChildren(text, retry);
+      if (route.isPrivate) {
+        const settings = document.createElement('a');
+        settings.href = (browser.runtime.getURL as (path: string) => string)(
+          '/popup.html',
+        );
+        settings.target = '_blank';
+        settings.rel = 'noreferrer';
+        settings.textContent = 'Open extension settings';
+        settings.style.marginInlineStart = '8px';
+        route.details.append(settings);
+      }
       route.previewArea.replaceChildren(
         message('Preview could not be rendered. Source view remains available.'),
       );
@@ -369,9 +399,96 @@ function updateResolvedStatus(route: RouteState, result: ResolveResult): void {
     route.metadataDiagnostic !== null ||
     result.resources.failed > 0 ||
     result.resources.skipped > 0;
-  route.status.textContent = partial ? 'Partial' : 'Ready';
-  route.details.style.display = 'none';
-  route.details.textContent = '';
+  route.status.setAttribute('role', 'status');
+  route.status.textContent = partial
+    ? `Preview ready · ${result.diagnostics.length + (route.metadataDiagnostic ? 1 : 0)} resource issues`
+    : 'Executable preview ready';
+  const inspector = createResourceInspector(result);
+  if (!partial) {
+    route.details.replaceChildren(inspector);
+    route.details.style.display = 'block';
+    return;
+  }
+  const diagnostics = [
+    ...(route.metadataDiagnostic
+      ? [
+          {
+            code: 'github-metadata',
+            message: route.metadataDiagnostic,
+            url: undefined,
+          },
+        ]
+      : []),
+    ...result.diagnostics,
+  ];
+  const disclosure = document.createElement('details');
+  const summary = document.createElement('summary');
+  summary.textContent = 'View resource issues';
+  const list = document.createElement('ul');
+  for (const diagnostic of diagnostics) {
+    const item = document.createElement('li');
+    item.textContent = diagnostic.url
+      ? `${diagnostic.url}: ${diagnostic.message}`
+      : diagnostic.message;
+    list.append(item);
+  }
+  const copy = createActionButton('Copy diagnostics', () => {
+    void navigator.clipboard.writeText(
+      diagnostics
+        .map((diagnostic) =>
+          diagnostic.url
+            ? `${diagnostic.code} ${diagnostic.url}: ${diagnostic.message}`
+            : `${diagnostic.code}: ${diagnostic.message}`,
+        )
+        .join('\n'),
+    );
+  });
+  disclosure.append(summary, list, copy);
+  route.details.replaceChildren(inspector, disclosure);
+  route.details.style.display = 'block';
+}
+
+function createResourceInspector(result: ResolveResult): HTMLElement {
+  const inspector = document.createElement('details');
+  const summary = document.createElement('summary');
+  summary.textContent = 'Resources';
+  const stats = document.createElement('p');
+  stats.textContent = `${result.resources.fetched} fetched · ${result.resources.inlined} packaged · ${result.performance.outputBytes} output bytes · ${Math.round(result.performance.resolveMs)} ms`;
+  const origins = new Set<string>();
+  const documentNode = new DOMParser().parseFromString(result.html, 'text/html');
+  for (const element of Array.from(
+    documentNode.querySelectorAll('[src], [href], [action]'),
+  )) {
+    for (const attribute of ['src', 'href', 'action']) {
+      const value = element.getAttribute(attribute);
+      if (!value || !/^https?:/i.test(value)) continue;
+      try {
+        origins.add(new URL(value).origin);
+      } catch {
+        // Malformed URLs are represented by resolver diagnostics.
+      }
+    }
+  }
+  const network = document.createElement('p');
+  network.textContent =
+    origins.size > 0
+      ? `External network origins: ${Array.from(origins).join(', ')}`
+      : 'No external network origins declared';
+  inspector.append(summary, stats, network);
+  return inspector;
+}
+
+function createActionButton(
+  label: string,
+  action: () => void,
+): HTMLButtonElement {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'btn btn-sm';
+  button.textContent = label;
+  button.style.marginInlineStart = '8px';
+  button.addEventListener('click', action);
+  return button;
 }
 
 function findTabBar(): HTMLElement | null {

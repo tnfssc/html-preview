@@ -9,7 +9,9 @@ export interface SandboxReadyMessage {
 export interface SandboxRenderMessage {
   kind: typeof SANDBOX_RENDER;
   channel: string;
-  html: string;
+  index: number;
+  total: number;
+  chunk: string;
 }
 
 export function isSandboxReadyMessage(
@@ -32,6 +34,32 @@ export function isSandboxRenderMessage(
   return (
     record.kind === SANDBOX_RENDER &&
     typeof record.channel === 'string' &&
-    typeof record.html === 'string'
+    Number.isInteger(record.index) &&
+    Number.isInteger(record.total) &&
+    typeof record.chunk === 'string' &&
+    (record.index as number) >= 0 &&
+    (record.total as number) > 0 &&
+    (record.index as number) < (record.total as number)
   );
+}
+
+export function postSandboxDocument(
+  target: Window,
+  channel: string,
+  html: string,
+): void {
+  const chunkSize = 64 * 1024;
+  const total = Math.max(1, Math.ceil(html.length / chunkSize));
+  for (let index = 0; index < total; index += 1) {
+    target.postMessage(
+      {
+        kind: SANDBOX_RENDER,
+        channel,
+        index,
+        total,
+        chunk: html.slice(index * chunkSize, (index + 1) * chunkSize),
+      } satisfies SandboxRenderMessage,
+      '*',
+    );
+  }
 }

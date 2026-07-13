@@ -254,9 +254,15 @@ export async function fetchRepositoryBytes(
     },
   });
   if (!response.ok) {
-    const error = new Error(
-      `GitHub private file API returned HTTP ${response.status}.`,
-    );
+    const message =
+      response.status === 401
+        ? 'GitHub rejected the saved token. Replace an expired or invalid token in extension settings.'
+        : response.status === 403
+          ? 'GitHub denied repository access. Grant the saved token read-only Contents access to this repository.'
+          : response.status === 404
+            ? 'GitHub could not access this file. Confirm the token includes this repository and the file still exists.'
+            : `GitHub private file API returned HTTP ${response.status}.`;
+    const error = new Error(message);
     debugError('github', 'fetch-authenticated-failed', error, {
       path,
       status: response.status,

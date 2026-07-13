@@ -9,7 +9,7 @@ export default defineConfig({
         ? 'GitHub HTML Preview (Debug)'
         : 'GitHub HTML Preview',
     description:
-      'Safely preview public and private HTML files and pull-request changes on GitHub',
+      'Run and compare commit-pinned public and private HTML directly on GitHub',
     permissions: ['storage'],
     host_permissions: [
       '*://github.com/*',
@@ -19,7 +19,7 @@ export default defineConfig({
     ],
     web_accessible_resources: [
       {
-        resources: ['preview.html'],
+        resources: ['preview.html', 'sandbox.html'],
         matches: ['*://github.com/*'],
         use_dynamic_url: true,
       },
@@ -52,5 +52,6 @@ export default defineConfig({
     action: {
       default_title: 'GitHub HTML Preview',
     },
+
   }),
 });

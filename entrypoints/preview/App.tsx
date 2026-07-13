@@ -3,11 +3,12 @@ import { fetchRepositoryFile } from '@/utils/github';
 import { resolveHtml } from '@/utils/resolveHtml';
 import { githubTokenStorage } from '@/utils/storage';
 import {
-  SANDBOX_RENDER,
   isSandboxReadyMessage,
+  postSandboxDocument,
 } from '@/utils/sandboxProtocol';
 import type { RepoRef, ResolveResult } from '@/utils/types';
 import { debugError, debugLog } from '@/utils/debug';
+import { recordResolveMetrics } from '@/utils/metrics';
 
 interface LoadState {
   kind: 'loading' | 'ready' | 'partial' | 'error';
@@ -49,6 +50,7 @@ function buildGitHubUrl(repoRef: RepoRef): string {
 
 export default function App(): React.JSX.Element {
   const [request] = useState(parseRepoRef);
+  const [retryKey, setRetryKey] = useState(0);
   const [state, setState] = useState<LoadState>({
     kind: 'loading',
     message: 'Fetching repository file…',
@@ -97,6 +99,10 @@ export default function App(): React.JSX.Element {
         const partial = result.diagnostics.some(
           (diagnostic) => diagnostic.level === 'error',
         );
+        recordResolveMetrics(
+          result.performance.resolveMs,
+          result.performance.outputBytes,
+        );
         setState({
           kind: partial ? 'partial' : 'ready',
           result,
@@ -125,7 +131,7 @@ export default function App(): React.JSX.Element {
     })();
 
     return () => controller.abort();
-  }, [request]);
+  }, [request, retryKey]);
 
   if (!request) {
     return <main className="error">Error: {state.message}</main>;
@@ -141,20 +147,109 @@ export default function App(): React.JSX.Element {
             {repoRef.owner}/{repoRef.repo}/{repoRef.path}
           </a>
         </h1>
-        <span className="meta">ref: {repoRef.ref.slice(0, 12)}</span>
+        <span className="meta">
+          Commit {repoRef.ref.slice(0, 12)} · Executable · Scripts and network
+          access on{request.privateRepo ? ' · Private' : ''}
+        </span>
+        <button type="button" onClick={() => setRetryKey((value) => value + 1)}>
+          Reload
+        </button>
       </header>
-      <div className={`preview-status preview-status-${state.kind}`} role="status">
+      <div
+        className={`preview-status preview-status-${state.kind}`}
+        role={state.kind === 'error' ? 'alert' : 'status'}
+      >
         {state.message}
       </div>
+      {state.result && (
+        <details className="diagnostics">
+          <summary>Resources and network</summary>
+          <p>
+            {state.result.resources.fetched} fetched ·{' '}
+            {state.result.resources.inlined} packaged ·{' '}
+            {state.result.performance.outputBytes} output bytes ·{' '}
+            {Math.round(state.result.performance.resolveMs)} ms
+          </p>
+          <p>{describeExternalOrigins(state.result.html)}</p>
+        </details>
+      )}
+      {state.result && state.result.diagnostics.length > 0 && (
+        <details className="diagnostics">
+          <summary>
+            View {state.result.diagnostics.length} resource issues
+          </summary>
+          <ul>
+            {state.result.diagnostics.map((diagnostic, index) => (
+              <li key={`${diagnostic.code}-${diagnostic.url ?? ''}-${index}`}>
+                {diagnostic.url ? `${diagnostic.url}: ` : ''}
+                {diagnostic.message}
+              </li>
+            ))}
+          </ul>
+          <button
+            type="button"
+            onClick={() =>
+              void navigator.clipboard.writeText(
+                state.result?.diagnostics
+                  .map((diagnostic) =>
+                    diagnostic.url
+                      ? `${diagnostic.code} ${diagnostic.url}: ${diagnostic.message}`
+                      : `${diagnostic.code}: ${diagnostic.message}`,
+                  )
+                  .join('\n') ?? '',
+              )
+            }
+          >
+            Copy diagnostics
+          </button>
+        </details>
+      )}
       {state.result ? (
         <SandboxFrame html={state.result.html} />
       ) : state.kind === 'error' ? (
-        <div className="error">Preview unavailable. {state.message}</div>
+        <div className="error">
+          <p>Preview unavailable. {state.message}</p>
+          <button type="button" onClick={() => setRetryKey((value) => value + 1)}>
+            Retry
+          </button>
+          {request.privateRepo && (
+            <a
+              href={(browser.runtime.getURL as (path: string) => string)(
+                '/popup.html',
+              )}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Open extension settings
+            </a>
+          )}
+        </div>
       ) : (
         <div className="loading">{state.message}</div>
       )}
     </main>
   );
+}
+
+function describeExternalOrigins(html: string): string {
+  const documentNode = new DOMParser().parseFromString(html, 'text/html');
+  const origins = new Set<string>();
+  for (const element of Array.from(
+    documentNode.querySelectorAll('[src], [href], [action]'),
+  )) {
+    for (const attribute of ['src', 'href', 'action']) {
+      const value = element.getAttribute(attribute);
+      if (!value || !/^https?:/i.test(value)) continue;
+      try {
+        origins.add(new URL(value).origin);
+      } catch {
+        // Resolver diagnostics represent malformed URLs.
+      }
+    }
+  }
+  return origins.size > 0
+    ? `External network origins: ${Array.from(origins).join(', ')}`
+    : 'No external network origins declared';
 }
 
 function SandboxFrame({ html }: { html: string }): React.JSX.Element {
@@ -189,10 +284,9 @@ function SandboxFrame({ html }: { html: string }): React.JSX.Element {
       }
       completed = true;
       debugLog('preview', 'sandbox-ready', { htmlBytes: html.length });
-      iframe.contentWindow?.postMessage(
-        { kind: SANDBOX_RENDER, channel, html },
-        '*',
-      );
+      if (iframe.contentWindow) {
+        postSandboxDocument(iframe.contentWindow, channel, html);
+      }
     };
     window.addEventListener('message', receiveReady);
     iframe.src = (browser.runtime.getURL as (path: string) => string)(

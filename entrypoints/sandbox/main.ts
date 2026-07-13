@@ -11,6 +11,8 @@ if (!channel) {
   document.body.textContent = 'Invalid preview handshake.';
 } else {
   let attempts = 0;
+  let chunks: string[] | null = null;
+  let received = 0;
   const announce = () => {
     attempts += 1;
     parent.postMessage({ kind: SANDBOX_READY, channel }, '*');
@@ -22,19 +24,29 @@ if (!channel) {
   const receivePreview = (event: MessageEvent<unknown>) => {
     if (
       event.source !== parent ||
-      !event.origin.startsWith('chrome-extension://') ||
       !isSandboxRenderMessage(event.data) ||
       event.data.channel !== channel
     ) {
       return;
     }
+    if (!chunks || chunks.length !== event.data.total) {
+      chunks = new Array<string>(event.data.total);
+      received = 0;
+    }
+    if (chunks[event.data.index] === undefined) {
+      chunks[event.data.index] = event.data.chunk;
+      received += 1;
+    }
+    if (received !== chunks.length) return;
     window.removeEventListener('message', receivePreview);
     window.clearInterval(announceTimer);
+    const html = chunks.join('');
     debugLog('sandbox', 'render-received', {
-      htmlBytes: event.data.html.length,
+      htmlBytes: html.length,
+      chunks: chunks.length,
     });
     document.open();
-    document.write(event.data.html);
+    document.write(html);
     document.close();
   };
   window.addEventListener('message', receivePreview);

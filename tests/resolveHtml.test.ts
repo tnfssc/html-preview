@@ -48,83 +48,7 @@ describe('resolveRepositoryUrl', () => {
   });
 });
 
-describe('static preview', () => {
-  it('inlines nested repository assets and blocks active or external content', async () => {
-    const requests: string[] = [];
-    const resources: Record<string, { body: string; type: string }> = {
-      'https://raw.githubusercontent.com/acme/reports/0123456789abcdef0123456789abcdef01234567/assets/site.css':
-        {
-          body: '@import "./theme.css"; .hero { background: url("../images/bg.png") }',
-          type: 'text/css',
-        },
-      'https://raw.githubusercontent.com/acme/reports/0123456789abcdef0123456789abcdef01234567/assets/theme.css':
-        {
-          body: '@font-face { src: url("./font.woff2") }',
-          type: 'text/css',
-        },
-      'https://raw.githubusercontent.com/acme/reports/0123456789abcdef0123456789abcdef01234567/images/bg.png':
-        { body: 'png-bytes', type: 'text/plain' },
-      'https://raw.githubusercontent.com/acme/reports/0123456789abcdef0123456789abcdef01234567/assets/font.woff2':
-        { body: 'font-bytes', type: 'text/plain' },
-      'https://raw.githubusercontent.com/acme/reports/0123456789abcdef0123456789abcdef01234567/reports/weekly/chart.png':
-        { body: 'chart-bytes', type: 'text/plain' },
-    };
-    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
-      const url = String(input);
-      requests.push(url);
-      const resource = resources[url];
-      if (!resource) return new Response('missing', { status: 404 });
-      return new Response(resource.body, {
-        status: 200,
-        headers: { 'content-type': resource.type },
-      });
-    }) as typeof fetch;
-
-    const result = await resolveHtml(
-      `<!doctype html><html><head>
-        <link rel="stylesheet" href="/assets/site.css">
-        <link rel="preload" href="https://tracker.example/pixel">
-        <script>window.pwned = true</script>
-        <meta http-equiv="refresh" content="0;url=https://tracker.example">
-      </head><body onload="window.pwned = true">
-        <img id="embedded" src="data:image/png;base64,AAAA">
-        <img id="chart" src="chart.png">
-        <iframe src="https://tracker.example/frame"></iframe>
-        <object data="https://tracker.example/object"></object>
-        <form action="https://tracker.example/post"><button formaction="https://tracker.example/other">Send</button></form>
-        <a id="local" href="#summary">Summary</a>
-        <a id="external" href="https://tracker.example">Tracker</a>
-      </body></html>`,
-      { target: 'static', repoRef },
-    );
-
-    const doc = new DOMParser().parseFromString(result.html, 'text/html');
-    const csp = doc.querySelector('meta[http-equiv="Content-Security-Policy" i]');
-    expect(csp?.getAttribute('content')).toContain("default-src 'none'");
-    expect(csp?.getAttribute('content')).toContain("connect-src 'none'");
-    expect(doc.querySelectorAll('script,iframe,object,embed').length).toBe(0);
-    expect(doc.querySelector('[onload]')).toBeNull();
-    expect(doc.querySelector('meta[http-equiv="refresh" i]')).toBeNull();
-    expect(doc.querySelector('link')).toBeNull();
-    expect(doc.querySelector('form')?.hasAttribute('action')).toBe(false);
-    expect(doc.querySelector('button')?.hasAttribute('formaction')).toBe(false);
-    expect(doc.querySelector('#local')?.getAttribute('href')).toBe('#summary');
-    expect(doc.querySelector('#external')?.hasAttribute('href')).toBe(false);
-    expect(doc.querySelector('#embedded')?.getAttribute('src')).toBe(
-      'data:image/png;base64,AAAA',
-    );
-    expect(doc.querySelector('#chart')?.getAttribute('src')).toMatch(
-      /^data:image\/png;base64,/,
-    );
-    const css = doc.querySelector('style')?.textContent ?? '';
-    expect(css).not.toContain('@import');
-    expect(css).toContain('data:image/png;base64,');
-    expect(css).toContain('data:font/woff2;base64,');
-    expect(requests.every((url) => url.startsWith('https://raw.githubusercontent.com/acme/reports/'))).toBe(true);
-    expect(requests).toHaveLength(5);
-    expect(result.resources.failed).toBe(0);
-  });
-
+describe('resolver errors', () => {
   it('aborts outstanding resolution', async () => {
     const controller = new AbortController();
     globalThis.fetch = vi.fn(
@@ -137,8 +61,8 @@ describe('static preview', () => {
       },
     ) as typeof fetch;
 
-    const pending = resolveHtml('<img src="slow.png">', {
-      target: 'static',
+    const pending = resolveHtml('<link rel="stylesheet" href="slow.css">', {
+      target: 'sandbox',
       repoRef,
       signal: controller.signal,
     });
@@ -155,8 +79,9 @@ describe('static preview', () => {
     ) as typeof fetch;
 
     const result = await resolveHtml('<img id="large" src="large.png">', {
-      target: 'static',
+      target: 'sandbox-private',
       repoRef,
+      githubToken: 'secret-token',
       limits: { maxResourceBytes: 4 },
     });
     const doc = new DOMParser().parseFromString(result.html, 'text/html');
@@ -186,14 +111,59 @@ describe('srcset', () => {
 });
 
 describe('sandbox preview', () => {
-  it('rewrites repository URLs, CSS imports, and root module imports to pinned CDN paths', async () => {
+  it('embeds public repository stylesheets while preserving executable scripts and rewriting resource URLs', async () => {
+    const resources: Record<string, { body: string; type: string }> = {
+      [`https://raw.githubusercontent.com/acme/reports/${repoRef.ref}/assets/site.css`]:
+        {
+          body: '@import "./theme.css"; .linked { background: url("./linked.png") }',
+          type: 'text/css',
+        },
+      [`https://raw.githubusercontent.com/acme/reports/${repoRef.ref}/assets/theme.css`]:
+        {
+          body: '.theme { background: url("./theme.png") }',
+          type: 'text/css',
+        },
+      [`https://raw.githubusercontent.com/acme/reports/${repoRef.ref}/assets/linked.png`]:
+        { body: 'linked', type: 'image/png' },
+      [`https://raw.githubusercontent.com/acme/reports/${repoRef.ref}/assets/theme.png`]:
+        { body: 'theme', type: 'image/png' },
+      [`https://raw.githubusercontent.com/acme/reports/${repoRef.ref}/reports/weekly/classic.js`]:
+        {
+          body: 'globalThis.classicLoaded = true;',
+          type: 'application/javascript',
+        },
+      [`https://raw.githubusercontent.com/acme/reports/${repoRef.ref}/reports/weekly/app.js`]:
+        {
+          body:
+            'import React from "react"; import "./dependency.js"; globalThis.moduleLoaded = React;',
+          type: 'application/javascript',
+        },
+      [`https://raw.githubusercontent.com/acme/reports/${repoRef.ref}/reports/weekly/dependency.js`]:
+        {
+          body: 'globalThis.dependencyLoaded = true;',
+          type: 'application/javascript',
+        },
+    };
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const resource = resources[String(input)];
+      return resource
+        ? new Response(resource.body, {
+            headers: { 'content-type': resource.type },
+          })
+        : new Response('missing', { status: 404 });
+    }) as typeof fetch;
     const result = await resolveHtml(
       `<!doctype html><html><head>
-        <style>@import "/assets/theme.css"; .hero { background: url("./hero.png") }</style>
-        <link rel="stylesheet" href="/assets/site.css">
+        <style>.inline { background: url("./inline.png") }</style>
+        <link rel="stylesheet" href="/assets/site.css" media="print" title="Printable" disabled>
       </head><body>
         <a id="fragment" href="#summary">Summary</a>
+        <a id="relative" href="./details.html?print=1#summary">Details</a>
         <img id="image" src="./chart.png">
+        <img id="responsive" srcset="./chart.png 1x, /assets/chart@2x.png 2x">
+        <form id="form" action="/submit"><button formaction="./confirm">Send</button></form>
+        <script id="inline">globalThis.previewLoaded = true;</script>
+        <script id="classic" src="./classic.js"></script>
         <script type="module" src="./app.js"></script>
       </body></html>`,
       { target: 'sandbox', repoRef },
@@ -205,22 +175,66 @@ describe('sandbox preview', () => {
     expect(doc.querySelector('base')?.href).toBe(
       `${cdnRoot}reports/weekly/`,
     );
-    expect(doc.querySelector('script[type="importmap"]')?.textContent).toBe(
-      JSON.stringify({ imports: { 'https://cdn.jsdelivr.net/': cdnRoot } }),
+    expect(
+      JSON.parse(
+        doc.querySelector('script[type="importmap"]')?.textContent ?? '{}',
+      ).imports,
+    ).toMatchObject({ 'https://cdn.jsdelivr.net/': cdnRoot });
+    const stylesheet = doc.querySelector<HTMLLinkElement>(
+      'link[rel~="stylesheet"]',
     );
-    expect(doc.querySelector('link')?.href).toBe(`${cdnRoot}assets/site.css`);
+    expect(stylesheet?.getAttribute('href')).toMatch(
+      /^data:text\/css;base64,/,
+    );
+    expect(stylesheet?.media).toBe('print');
+    expect(stylesheet?.title).toBe('Printable');
+    expect(stylesheet?.hasAttribute('disabled')).toBe(true);
+    const stylesheetCss = decodeDataUrl(stylesheet?.href ?? '');
+    expect(stylesheetCss).toContain('data:image/png;base64,bGlua2Vk');
+    expect(stylesheetCss).toContain('data:image/png;base64,dGhlbWU=');
+    expect(doc.querySelector('#inline')?.textContent).toContain(
+      'globalThis.previewLoaded = true;',
+    );
     expect(doc.querySelector('#image')?.getAttribute('src')).toBe(
       `${cdnRoot}reports/weekly/chart.png`,
     );
-    expect(doc.querySelector('script[type="module"][src]')?.getAttribute('src')).toBe(
-      `${cdnRoot}reports/weekly/app.js`,
+    expect(doc.querySelector('#responsive')?.getAttribute('srcset')).toBe(
+      `${cdnRoot}reports/weekly/chart.png 1x, ${cdnRoot}assets/chart%402x.png 2x`,
+    );
+    expect(doc.querySelector('#relative')?.getAttribute('href')).toBe(
+      `${cdnRoot}reports/weekly/details.html?print=1#summary`,
+    );
+    expect(doc.querySelector('#form')?.getAttribute('action')).toBe(
+      `${cdnRoot}submit`,
+    );
+    expect(doc.querySelector('#form button')?.getAttribute('formaction')).toBe(
+      `${cdnRoot}reports/weekly/confirm`,
+    );
+    expect(doc.querySelector('#classic')?.getAttribute('src')).toBe(
+      'data:application/javascript;base64,Z2xvYmFsVGhpcy5jbGFzc2ljTG9hZGVkID0gdHJ1ZTs=',
+    );
+    expect(
+      doc.querySelector('script[type="module"][src]')?.getAttribute('src'),
+    ).toMatch(/^data:application\/javascript;base64,/);
+    const publicModuleSource = decodeDataUrl(
+      doc.querySelector('script[type="module"][src]')?.getAttribute('src') ??
+        '',
+    );
+    expect(publicModuleSource).toContain('from "react"');
+    expect(publicModuleSource).toContain(
+      'https://private-preview.invalid/reports/weekly/dependency.js',
     );
     expect(doc.querySelector('#fragment')?.getAttribute('href')).toBe('#summary');
-    const css = doc.querySelector('style')?.textContent ?? '';
-    expect(css).toContain(`@import url("${cdnRoot}assets/theme.css")`);
-    expect(css).toContain(
-      `url("${cdnRoot}reports/weekly/hero.png")`,
+    const inlineCss = doc.querySelector('style')?.textContent ?? '';
+    expect(inlineCss).toContain(
+      `url("${cdnRoot}reports/weekly/inline.png")`,
     );
+    expect(result.resources).toMatchObject({
+      fetched: 7,
+      inlined: 8,
+      rewritten: 8,
+      failed: 0,
+    });
   });
 
   it('packages private CSS, images, classic scripts, and module graphs without exposing token', async () => {
@@ -274,6 +288,7 @@ describe('sandbox preview', () => {
         <link rel=\"stylesheet\" href=\"/assets/private.css\">
       </head><body>
         <img id=\"chart\" src=\"./chart.png\">
+        <script id=\"inline\">globalThis.inlineScriptLoaded = true;</script>
         <script id=\"classic\" src=\"./classic.js\"></script>
         <script id=\"module\" type=\"module\" src=\"./main.js\"></script>
       </body></html>`,
@@ -286,7 +301,12 @@ describe('sandbox preview', () => {
     );
 
     const doc = new DOMParser().parseFromString(result.html, 'text/html');
-    expect(doc.querySelector('style')?.textContent).toContain(
+    expect(
+      decodeDataUrl(
+        doc.querySelector<HTMLLinkElement>('link[rel~="stylesheet"]')?.href ??
+          '',
+      ),
+    ).toContain(
       'data:image/png;base64,',
     );
     expect(doc.querySelector('#chart')?.getAttribute('src')).toMatch(
@@ -294,6 +314,9 @@ describe('sandbox preview', () => {
     );
     expect(doc.querySelector('#classic')?.getAttribute('src')).toMatch(
       /^data:application\/javascript;base64,/,
+    );
+    expect(doc.querySelector('#inline')?.textContent).toContain(
+      'globalThis.inlineScriptLoaded = true;',
     );
     expect(doc.querySelector('#module')?.getAttribute('src')).toMatch(
       /^data:application\/javascript;base64,/,
@@ -320,4 +343,43 @@ describe('sandbox preview', () => {
     ).toBe(true);
     expect(result.resources.failed).toBe(0);
   });
+
+  it('requires a saved token before packaging private preview resources', async () => {
+    const fetchMock = vi.fn();
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    await expect(
+      resolveHtml('<img src="private.png">', {
+        target: 'sandbox-private',
+        repoRef,
+      }),
+    ).rejects.toThrow('Private repository access requires a saved GitHub token.');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('enforces encoded output limits before sandbox transport', async () => {
+    await expect(
+      resolveHtml(`<main>${'x'.repeat(512)}</main>`, {
+        target: 'sandbox',
+        repoRef,
+        limits: { maxOutputBytes: 128 },
+      }),
+    ).rejects.toThrow('Resolved preview exceeds 128 byte output limit.');
+  });
+
+  it('resolves a large document within the local performance budget', async () => {
+    const html = `<main>${'<section>report row</section>'.repeat(10_000)}</main>`;
+    const result = await resolveHtml(html, {
+      target: 'sandbox',
+      repoRef,
+    });
+
+    expect(result.performance.outputBytes).toBeGreaterThan(200_000);
+    expect(result.performance.resolveMs).toBeLessThan(2_000);
+  });
 });
+
+function decodeDataUrl(url: string): string {
+  const encoded = url.split(',')[1] ?? '';
+  return atob(encoded);
+}

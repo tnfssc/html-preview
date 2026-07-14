@@ -200,6 +200,64 @@ test('blob preview embeds local CSS and executable script sources in a sandbox',
   }
 });
 
+test('blob resource issues can be retried without reloading GitHub', async () => {
+  const { context, page } = await launchWithExtension();
+  const url = 'https://github.com/acme/reports/blob/main/retry.html';
+  const raw =
+    `https://raw.githubusercontent.com/acme/reports/${commit}/retry.png`;
+  let attempts = 0;
+  try {
+    await context.route(url, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/html',
+        body: githubBlobFixture(
+          '<h1>Retry fixture</h1><img id="retry-image" src="./retry.png">',
+          commit,
+          'retry.html',
+        ),
+      });
+    });
+    await context.route(raw, async (route) => {
+      attempts += 1;
+      await route.fulfill(
+        attempts === 1
+          ? { status: 503, body: 'Unavailable' }
+          : {
+              status: 200,
+              contentType: 'image/png',
+              body: 'retry-image',
+            },
+      );
+    });
+    await page.goto(url);
+    await page.getByRole('tab', { name: 'Preview' }).click();
+    const container = page.locator('.gh-html-preview-container');
+    await expect(container.getByRole('status')).toHaveText(
+      '1 resource issues',
+    );
+    await page.evaluate(() => {
+      Array.from(
+        document.querySelectorAll<HTMLButtonElement>(
+          '.gh-html-preview-container button',
+        ),
+      )
+        .find((button) => button.textContent?.trim() === 'Retry')
+        ?.click();
+    });
+    await expect(container.getByRole('status')).toBeHidden();
+    await expect(
+      container
+        .locator('iframe[title="Executable HTML preview"]')
+        .contentFrame()
+        .locator('#retry-image'),
+    ).toHaveAttribute('src', /^data:image\/png;base64,/);
+    expect(attempts).toBe(2);
+  } finally {
+    await context.close();
+  }
+});
+
 test('full preview executes public repository scripts only inside sandbox', async () => {
   const { context, page, extensionId } = await launchWithExtension();
   try {
@@ -942,6 +1000,7 @@ test('organization SSO falls back to embedded PR metadata and GitHub session raw
     `<script type="application/json" data-target="react-app.embeddedData">${embedded}</script></body>`,
   );
   const sessionRequests: string[] = [];
+  let headAttempts = 0;
   try {
     await context.route('**/*', async (route) => {
       const url = route.request().url();
@@ -967,6 +1026,13 @@ test('organization SSO falls back to embedded PR metadata and GitHub session raw
         );
       if (sessionRaw) {
         sessionRequests.push(sessionRaw[1]);
+        if (sessionRaw[1] === head) {
+          headAttempts += 1;
+          if (headAttempts === 1) {
+            await route.fulfill({ status: 503, body: 'Unavailable' });
+            return;
+          }
+        }
         await route.fulfill({
           status: 200,
           contentType: 'text/plain',
@@ -1009,6 +1075,17 @@ test('organization SSO falls back to embedded PR metadata and GitHub session raw
     await expect
       .poll(() => sessionRequests.sort())
       .toEqual([head, base].sort());
+    const comparison = page.locator('.gh-html-preview-pr-rich');
+    await expect(comparison.getByRole('button', { name: 'Retry' })).toBeVisible();
+    await comparison.getByRole('button', { name: 'Retry' }).click();
+    await expect(
+      comparison.locator(`iframe[title="Before HTML preview for ${filePath}"]`),
+    ).toHaveCount(1);
+    await expect(
+      comparison.locator(`iframe[title="After HTML preview for ${filePath}"]`),
+    ).toHaveCount(1);
+    expect(headAttempts).toBe(2);
+    await expect(comparison.getByRole('button', { name: 'Retry' })).toBeHidden();
   } finally {
     await context.close();
   }

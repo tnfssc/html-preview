@@ -386,21 +386,9 @@ async function ensureResolved(route: RouteState): Promise<void> {
       const text = document.createElement('span');
       text.textContent = errorMessage;
       const retry = createActionButton('Retry', () => {
-        route.details.style.display = 'none';
-        void ensureResolved(route);
+        window.setTimeout(() => retryResolution(route), 0);
       });
       route.details.replaceChildren(text, retry);
-      if (route.isPrivate) {
-        const settings = document.createElement('a');
-        settings.href = (browser.runtime.getURL as (path: string) => string)(
-          '/popup.html',
-        );
-        settings.target = '_blank';
-        settings.rel = 'noreferrer';
-        settings.textContent = 'Open extension settings';
-        settings.style.marginInlineStart = '8px';
-        route.details.append(settings);
-      }
       route.previewArea.replaceChildren(
         message('Preview could not be rendered. Source view remains available.'),
       );
@@ -460,9 +448,30 @@ function updateResolvedStatus(route: RouteState, result: ResolveResult): void {
         .join('\n'),
     );
   });
-  disclosure.append(summary, list, copy);
+  const retry = createActionButton('Retry', () => {
+    window.setTimeout(() => retryResolution(route), 0);
+  });
+  disclosure.append(summary, list, retry, copy);
   route.details.replaceChildren(disclosure);
   route.details.style.display = 'block';
+}
+
+function retryResolution(route: RouteState): void {
+  route.render?.destroy();
+  route.render = null;
+  void removePreviewSnapshot(route.snapshotId);
+  route.snapshotId = null;
+  route.fullLink.href = '#';
+  route.fullLink.style.cssText =
+    'color:var(--fgColor-muted,#59636e);text-decoration:none;pointer-events:none;';
+  route.fullLink.setAttribute('aria-disabled', 'true');
+  route.status.style.removeProperty('display');
+  route.status.setAttribute('role', 'status');
+  route.status.textContent = 'Retrying…';
+  route.details.replaceChildren();
+  route.details.style.display = 'none';
+  route.previewArea.replaceChildren(message('Retrying preview resources…'));
+  void ensureResolved(route);
 }
 
 function createActionButton(

@@ -54,6 +54,8 @@ interface DiffRouteState {
   readonly richDiffs: Set<RichDiffState>;
 }
 
+class ExpectedMissingSideError extends Error {}
+
 interface DiffTarget {
   file: HTMLElement;
   header: HTMLElement;
@@ -91,6 +93,7 @@ interface RichDiffState {
   controller: AbortController | null;
   baseRender: RenderResult | null;
   headRender: RenderResult | null;
+  retryableFailures: number;
   comparison: DiffComparison | null;
   resolving: Promise<void> | null;
   mode: 'source' | 'split';
@@ -985,7 +988,8 @@ function insertPreviewControls(
   syncInput.checked = preferences.syncScroll;
   syncInput.setAttribute('aria-label', 'Synchronize preview scrolling');
   syncLabel.append(syncInput, document.createTextNode('Sync scroll'));
-  const reloadButton = createToolbarButton('Reload previews');
+  const reloadButton = createToolbarButton('Retry');
+  reloadButton.style.display = 'none';
   const fullscreenButton = createToolbarButton('Full screen');
   fullscreenButton.setAttribute('aria-pressed', 'false');
   const overlayLabel = document.createElement('label');
@@ -1007,7 +1011,7 @@ function insertPreviewControls(
   layoutStatus.setAttribute('aria-live', 'polite');
   const effectiveWidth = document.createElement('span');
   effectiveWidth.setAttribute('aria-live', 'polite');
-  header.append(status);
+  header.append(status, reloadButton);
 
   const comparisonArea = document.createElement('div');
   comparisonArea.style.cssText =
@@ -1073,6 +1077,7 @@ function insertPreviewControls(
     controller: null,
     baseRender: null,
     headRender: null,
+    retryableFailures: 0,
     comparison: null,
     resolving: null,
     mode: 'source',
@@ -1255,7 +1260,7 @@ function startRender(
   if (state.resolving) return;
   state.reloadButton.disabled = true;
   state.reloadButton.setAttribute('aria-disabled', 'true');
-  state.reloadButton.textContent = 'Reloading…';
+  state.reloadButton.textContent = 'Retrying…';
   state.resolving = renderRichComparison(
     state,
     routeState,
@@ -1264,7 +1269,7 @@ function startRender(
     state.resolving = null;
     state.reloadButton.disabled = false;
     state.reloadButton.removeAttribute('aria-disabled');
-    state.reloadButton.textContent = 'Reload previews';
+    state.reloadButton.textContent = 'Retry';
   });
 }
 
@@ -1280,7 +1285,10 @@ async function renderRichComparison(
     state.baseRender = null;
     state.headRender = null;
     state.comparison = null;
+    routeState.metadata = null;
+    routeState.fileMetadata = null;
   }
+  state.retryableFailures = 0;
   const controller = new AbortController();
   state.controller = controller;
   const abort = () => controller.abort();
@@ -1350,8 +1358,20 @@ async function renderRichComparison(
           : 'minmax(0,1fr)'
         : 'minmax(0,1fr)';
     state.status.textContent =
-      !baseAvailable && !headAvailable ? 'Unavailable' : '';
-    if ((baseAvailable || headAvailable) && state.status.parentElement) {
+      state.retryableFailures > 0
+        ? `${state.retryableFailures} resource issues`
+        : !baseAvailable && !headAvailable
+          ? 'Unavailable'
+          : '';
+    state.reloadButton.style.display =
+      state.retryableFailures > 0 || (!baseAvailable && !headAvailable)
+        ? 'inline-flex'
+        : 'none';
+    if (
+      (baseAvailable || headAvailable) &&
+      state.retryableFailures === 0 &&
+      state.status.parentElement
+    ) {
       state.status.parentElement.style.display = 'none';
     }
     debugLog('pr', 'rich-comparison-complete', {
@@ -1364,6 +1384,8 @@ async function renderRichComparison(
       error instanceof Error
         ? `Error: ${error.message}`
         : 'Error: Comparison failed.';
+    state.retryableFailures += 1;
+    state.reloadButton.style.display = 'inline-flex';
     debugError('pr', 'rich-comparison-failed', error, {
       path: state.target.path,
     });
@@ -1405,9 +1427,13 @@ async function renderComparisonSide(
           privateRepo: side.privateRepo,
         });
       } else if (sideName === 'base' && info?.status === 'added') {
-        throw new Error('File was added in this diff; no Before version exists.');
+        throw new ExpectedMissingSideError(
+          'File was added in this diff; no Before version exists.',
+        );
       } else if (sideName === 'head' && info?.status === 'removed') {
-        throw new Error('File was deleted in this diff; no After version exists.');
+        throw new ExpectedMissingSideError(
+          'File was deleted in this diff; no After version exists.',
+        );
       } else {
         throw initialError;
       }
@@ -1424,6 +1450,8 @@ async function renderComparisonSide(
       result.performance.resolveMs,
       result.performance.outputBytes,
     );
+    state.retryableFailures +=
+      result.resources.failed + result.resources.skipped;
     const onScroll = (position: ScrollPosition) => {
       if (sideName === 'base') state.headRender?.setScroll(position);
       else state.baseRender?.setScroll(position);
@@ -1442,6 +1470,9 @@ async function renderComparisonSide(
     return true;
   } catch (error) {
     if (signal.aborted) throw error;
+    if (!(error instanceof ExpectedMissingSideError)) {
+      state.retryableFailures += 1;
+    }
     area.replaceChildren(
       createSideMessage(
         sideName === 'base'

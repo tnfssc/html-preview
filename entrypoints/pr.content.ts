@@ -1414,7 +1414,7 @@ async function renderComparisonSide(
     }
     const privateRepo = side.privateRepo || file.authenticated;
     const result = await resolveHtml(file.text, {
-      target: privateRepo ? 'sandbox-private' : 'sandbox',
+      target: 'sandbox-private',
       repoRef,
       privateRepo,
       signal,

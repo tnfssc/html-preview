@@ -470,6 +470,7 @@ async function resolvePrivateSandboxDocument(
     ),
   );
 
+  rewritePreviewLinks(doc, sourcePath, loader.repoRef);
   const moduleMap = await packageRepositoryScripts(doc, sourcePath, loader);
 
   if (Object.keys(moduleMap).length > 0) {
@@ -477,6 +478,39 @@ async function resolvePrivateSandboxDocument(
     importMap.type = 'importmap';
     importMap.textContent = JSON.stringify({ imports: moduleMap });
     doc.head.prepend(importMap);
+  }
+}
+
+function rewritePreviewLinks(
+  doc: Document,
+  sourcePath: string,
+  repoRef: Readonly<RepoRef>,
+): void {
+  for (const link of Array.from(
+    doc.querySelectorAll<HTMLAnchorElement | HTMLAreaElement>(
+      'a[href], area[href]',
+    ),
+  )) {
+    const href = link.getAttribute('href');
+    if (!href) continue;
+    const resolved = resolveRepositoryUrl(href, repoRef, sourcePath);
+    if (resolved.kind === 'fragment') continue;
+    if (resolved.kind === 'repo' && resolved.path !== undefined) {
+      const path = resolved.path
+        .split('/')
+        .map(encodeURIComponent)
+        .join('/');
+      link.href =
+        `https://github.com/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}` +
+        `/blob/${encodeURIComponent(repoRef.ref)}/${path}${resolved.search ?? ''}${resolved.hash ?? ''}`;
+    } else if (resolved.kind === 'external') {
+      link.href = resolved.value;
+    } else {
+      link.removeAttribute('href');
+      continue;
+    }
+    link.target = '_blank';
+    link.rel = 'noreferrer';
   }
 }
 

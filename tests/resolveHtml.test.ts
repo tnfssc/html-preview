@@ -243,6 +243,28 @@ describe('sandbox preview', () => {
     });
   });
 
+  it('keeps fragment links in-document and sends repository links to GitHub', async () => {
+    const result = await resolveHtml(
+      '<h2 id="set-1">Set 1</h2><a id="fragment" href="#set-1">Set 1</a><a id="document" href="./details.html#part">Details</a>',
+      {
+        target: 'sandbox-private',
+        repoRef,
+        privateRepo: false,
+      },
+    );
+    const doc = new DOMParser().parseFromString(result.html, 'text/html');
+    expect(doc.querySelector('base')).toBeNull();
+    expect(doc.querySelector('#fragment')?.getAttribute('href')).toBe('#set-1');
+    expect(doc.querySelector('#document')?.getAttribute('href')).toBe(
+      `https://github.com/acme/reports/blob/${repoRef.ref}/reports/weekly/details.html#part`,
+    );
+    expect(doc.querySelector('#document')?.getAttribute('target')).toBe('_blank');
+    expect(doc.querySelector('#document')?.getAttribute('rel')).toBe(
+      'noreferrer',
+    );
+    expect(result.html).not.toContain('cdn.jsdelivr.net');
+  });
+
   it('packages private CSS, images, classic scripts, and module graphs through the GitHub session', async () => {
     vi.stubGlobal(
       'location',

@@ -23,6 +23,7 @@ const privatePreviewHtml = `<!doctype html><html><head>
   <link rel="stylesheet" href="/assets/private.css">
 </head><body>
   <h2 id="private-title">Private report</h2>
+  <a id="fragment-link" href="#private-title">Jump to private title</a>
   <img id="private-image" src="./secret.png" alt="Secret chart">
   <p id="classic-result">Classic waiting</p>
   <p id="module-result">Module waiting</p>
@@ -178,7 +179,7 @@ test('blob preview embeds local CSS and executable script sources in a sandbox',
     );
     await expect(frame.locator('#chart')).toHaveAttribute(
       'src',
-      /^https:\/\/cdn\.jsdelivr\.net\//,
+      /^data:image\/png;base64,/,
     );
     await expect(
       frame.locator('meta[http-equiv="Content-Security-Policy" i]'),
@@ -1307,6 +1308,9 @@ test('private blob and full preview use only the signed-in GitHub session', asyn
     if (authorization) authorizationHeaders.push(authorization);
   });
   try {
+    await context.route('https://raw.githubusercontent.com/**', async (route) => {
+      await route.fulfill({ status: 404, body: 'Not Found' });
+    });
     await context.route('https://github.com/private-owner/private-repo/raw/**', async (route) => {
       const url = route.request().url();
       const resources: Record<string, { body: string; type: string }> = {
@@ -1351,7 +1355,9 @@ test('private blob and full preview use only the signed-in GitHub session', asyn
           privatePreviewHtml,
           commit,
           'report/index.html',
-          true,
+          false,
+          'private-owner',
+          'private-repo',
         ),
       });
     });
@@ -1413,6 +1419,14 @@ test('private blob and full preview use only the signed-in GitHub session', asyn
     await expect(inlineFrame.locator('#module-result')).toHaveText(
       'Module executed',
     );
+    await inlineFrame.locator('#fragment-link').click();
+    await expect(inlineFrame.locator('#private-title')).toBeVisible();
+    const fragmentLocation = await inlineFrame
+      .locator('body')
+      .evaluate(() => location.href);
+    expect(fragmentLocation).toContain('#private-title');
+    expect(fragmentLocation).not.toContain('cdn.jsdelivr.net');
+    expect(fragmentLocation).not.toContain('view-source:');
     expect(sessionRequests).toHaveLength(5);
     expect(
       await page
@@ -1455,8 +1469,17 @@ function githubBlobFixture(
   oid: string,
   filePath: string,
   isPrivate = false,
+  owner = isPrivate ? 'private-owner' : 'acme',
+  repo = isPrivate ? 'private-repo' : 'reports',
 ): string {
-  const payload = githubEmbeddedPayload(html, oid, filePath, isPrivate);
+  const payload = githubEmbeddedPayload(
+    html,
+    oid,
+    filePath,
+    isPrivate,
+    owner,
+    repo,
+  );
   return `<!doctype html><html><head><style>
     ul.SegmentedControl { display: flex; margin: 0; padding: 0; list-style: none; }
     .native-segment { display: block; }
@@ -1488,12 +1511,14 @@ function githubEmbeddedPayload(
   oid: string,
   filePath: string,
   isPrivate = false,
+  owner = isPrivate ? 'private-owner' : 'acme',
+  repo = isPrivate ? 'private-repo' : 'reports',
 ): string {
   return JSON.stringify({
     payload: {
       repo: {
-        ownerLogin: isPrivate ? 'private-owner' : 'acme',
-        name: isPrivate ? 'private-repo' : 'reports',
+        ownerLogin: owner,
+        name: repo,
         isPrivate,
       },
       refInfo: { currentOid: oid, name: 'main' },

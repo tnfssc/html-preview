@@ -9,6 +9,7 @@ Chrome extension for running and comparing commit-pinned public and private `.ht
 - **Open full preview** opens the same commit-pinned document in a dedicated executable sandbox.
 - Pull-request, commit, and release-compare file views get lightweight **Code** and **Preview** controls. Comparisons use exact base and head repositories and commits, including forks.
 - Added and deleted files render whichever side exists; edited files render before and after.
+- Repository assets are packaged into the sandbox instead of loaded from a public CDN. Fragment links stay inside the preview; links to other repository documents open the exact-ref GitHub blob in a new tab.
 - Before/after scrolling uses shared HTML IDs, named anchors, and matching headings to align corresponding content. It interpolates between matched anchors and falls back to proportional document progress when no shared anchor exists.
 - GitHub SPA navigation, commit-filtered PR routes, lazy `Load Diff` cards, and oversized commit/release diffs are supported. PR views use GitHub's native file cards; fallback cards are limited to commit and compare pages where GitHub omits the diff DOM.
 - File collapse hides and restores active previews with GitHub's native card. Inline review comments stay visible in Preview while unrelated source rows remain hidden.

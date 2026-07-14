@@ -94,7 +94,10 @@ describe('packaged Chrome extension', () => {
 
   it('contains release-grade product identity', async () => {
     const manifest = await readManifest();
+    const packageJson = JSON.parse(
+      await readFile('package.json', 'utf8'),
+    ) as { version: string };
     expect(manifest.name).toBe('GitHub HTML Preview');
-    expect(manifest.version).toBe('0.3.0');
+    expect(manifest.version).toBe(packageJson.version);
   });
 });

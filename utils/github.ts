@@ -15,6 +15,22 @@ export interface PrFilesRoute {
   pullNumber: string;
 }
 
+export type HtmlDiffRoute =
+  | ({ kind: 'pull' } & PrFilesRoute)
+  | {
+      kind: 'commit';
+      owner: string;
+      repo: string;
+      head: string;
+    }
+  | {
+      kind: 'compare';
+      owner: string;
+      repo: string;
+      base: string;
+      head: string;
+    };
+
 const DEFAULT_MAX_FILE_BYTES = 2 * 1024 * 1024;
 
 export interface RepositoryBytes {
@@ -55,6 +71,50 @@ export function parsePrFilesUrl(url: string | URL): PrFilesRoute | null {
     owner: decodeSegment(match[1]),
     repo: decodeSegment(match[2]),
     pullNumber: match[3],
+  };
+}
+
+export function parseHtmlDiffUrl(url: string | URL): HtmlDiffRoute | null {
+  const parsed = typeof url === 'string' ? new URL(url) : url;
+  const filteredCommit =
+    /^\/([^/]+)\/([^/]+)\/pull\/\d+\/(?:files|changes)\/([0-9a-f]{7,40})\/?$/i.exec(
+      parsed.pathname,
+    );
+  if (filteredCommit) {
+    return {
+      kind: 'commit',
+      owner: decodeSegment(filteredCommit[1]),
+      repo: decodeSegment(filteredCommit[2]),
+      head: filteredCommit[3],
+    };
+  }
+  const pull = parsePrFilesUrl(parsed);
+  if (pull) return { kind: 'pull', ...pull };
+
+  const commit =
+    /^\/([^/]+)\/([^/]+)\/commit\/([0-9a-f]{7,40})\/?$/i.exec(
+      parsed.pathname,
+    );
+  if (commit) {
+    return {
+      kind: 'commit',
+      owner: decodeSegment(commit[1]),
+      repo: decodeSegment(commit[2]),
+      head: commit[3],
+    };
+  }
+
+  const compare =
+    /^\/([^/]+)\/([^/]+)\/compare\/(.+)\.\.\.(.+)\/?$/i.exec(
+      parsed.pathname,
+    );
+  if (!compare) return null;
+  return {
+    kind: 'compare',
+    owner: decodeSegment(compare[1]),
+    repo: decodeSegment(compare[2]),
+    base: decodePath(compare[3]),
+    head: decodePath(compare[4].replace(/\/$/, '')),
   };
 }
 

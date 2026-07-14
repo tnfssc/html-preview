@@ -306,6 +306,7 @@ export default defineContentScript({
 
 async function ensureResolved(route: RouteState): Promise<void> {
   if (route.render || route.resolving) return route.resolving ?? Promise.resolve();
+  route.status.style.removeProperty('display');
   route.status.textContent = 'Loading';
   route.status.setAttribute('role', 'status');
   route.details.style.display = 'none';
@@ -401,12 +402,12 @@ function updateResolvedStatus(route: RouteState, result: ResolveResult): void {
     result.resources.skipped > 0;
   route.status.setAttribute('role', 'status');
   route.status.textContent = partial
-    ? `Preview ready · ${result.diagnostics.length + (route.metadataDiagnostic ? 1 : 0)} resource issues`
-    : 'Executable preview ready';
-  const inspector = createResourceInspector(result);
+    ? `${result.diagnostics.length + (route.metadataDiagnostic ? 1 : 0)} resource issues`
+    : '';
+  route.status.style.display = partial ? '' : 'none';
   if (!partial) {
-    route.details.replaceChildren(inspector);
-    route.details.style.display = 'block';
+    route.details.replaceChildren();
+    route.details.style.display = 'none';
     return;
   }
   const diagnostics = [
@@ -444,38 +445,8 @@ function updateResolvedStatus(route: RouteState, result: ResolveResult): void {
     );
   });
   disclosure.append(summary, list, copy);
-  route.details.replaceChildren(inspector, disclosure);
+  route.details.replaceChildren(disclosure);
   route.details.style.display = 'block';
-}
-
-function createResourceInspector(result: ResolveResult): HTMLElement {
-  const inspector = document.createElement('details');
-  const summary = document.createElement('summary');
-  summary.textContent = 'Resources';
-  const stats = document.createElement('p');
-  stats.textContent = `${result.resources.fetched} fetched · ${result.resources.inlined} packaged · ${result.performance.outputBytes} output bytes · ${Math.round(result.performance.resolveMs)} ms`;
-  const origins = new Set<string>();
-  const documentNode = new DOMParser().parseFromString(result.html, 'text/html');
-  for (const element of Array.from(
-    documentNode.querySelectorAll('[src], [href], [action]'),
-  )) {
-    for (const attribute of ['src', 'href', 'action']) {
-      const value = element.getAttribute(attribute);
-      if (!value || !/^https?:/i.test(value)) continue;
-      try {
-        origins.add(new URL(value).origin);
-      } catch {
-        // Malformed URLs are represented by resolver diagnostics.
-      }
-    }
-  }
-  const network = document.createElement('p');
-  network.textContent =
-    origins.size > 0
-      ? `External network origins: ${Array.from(origins).join(', ')}`
-      : 'No external network origins declared';
-  inspector.append(summary, stats, network);
-  return inspector;
 }
 
 function createActionButton(

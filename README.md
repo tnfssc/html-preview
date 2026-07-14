@@ -7,11 +7,47 @@ Chrome extension for running and comparing commit-pinned public and private `.ht
 - Blob pages get a **Preview** tab beside GitHub's file controls. Repository scripts run in an isolated executable frame; repository CSS and module graphs are packaged against the exact commit.
 - Preview headers disclose **Executable · Scripts and network access on**. Preview code cannot access extension APIs, GitHub's parent DOM, or extension storage, but it can communicate with external services.
 - **Open full preview** opens the same commit-pinned document in a dedicated executable sandbox.
-- Pull-request file views get **Code diff**, **Before & after**, and **After preview** views plus **Open after preview**. Before/after uses exact base and head repositories and commits, including forks.
-- Comparison tools include synchronized horizontal/vertical scrolling, Fit/Desktop/Tablet/Mobile widths, reload, fullscreen, and partial-side handling for added or deleted files.
+- Pull-request, commit, and release-compare file views get lightweight **Code** and **Preview** controls. Comparisons use exact base and head repositories and commits, including forks.
+- Added and deleted files render whichever side exists; edited files render before and after.
+- Before/after scrolling uses shared HTML IDs, named anchors, and matching headings to align corresponding content. It interpolates between matched anchors and falls back to proportional document progress when no shared anchor exists.
+- GitHub SPA navigation, commit-filtered PR routes, lazy `Load Diff` cards, and oversized commit/release diffs are supported. PR views use GitHub's native file cards; fallback cards are limited to commit and compare pages where GitHub omits the diff DOM.
+- File collapse hides and restores active previews with GitHub's native card. Inline review comments stay visible in Preview while unrelated source rows remain hidden.
+- UI stays light: show only controls required for primary preview flow. Put necessary secondary actions in a kebab menu instead of persistent toolbars, panels, or explanatory sections.
 - Public repositories need no credentials.
 - Private access uses an optional fine-grained GitHub token stored in `chrome.storage.local`. Give it read-only **Contents**, **Metadata**, and **Pull requests** access only for selected repositories.
 - Tokens are sent only as `Authorization` headers to `https://api.github.com`; they are never placed in URLs, preview HTML, logs, or release artifacts.
+
+## Product requirements
+
+- Preview behavior must survive GitHub client-side navigation without a reload.
+- Blob, PR, commit, commit-filtered PR, and release-comparison routes must render exact commit-pinned HTML.
+- Added and removed HTML must use one full-width pane. Never render an empty opposite pane.
+- Edited HTML must render both revisions without visible **Before**, **After**, or **Ready** labels.
+- Successful previews must not show resource panels or persistent diagnostics. Resource failures must remain actionable.
+- Review comments and GitHub collapse/expand behavior must continue working in Preview.
+- GitHub native and extension fallback cards must never produce duplicate previews.
+- Long HTML must remain scrollable. Edited panes must synchronize semantically when stable anchors exist and proportionally otherwise.
+- UI must remain visually light. Persistent controls are limited to primary actions; necessary secondary actions belong in a kebab menu.
+- Private-repository support must never expose tokens to preview content, URLs, logs, screenshots, or release artifacts.
+
+## Comparison scroll synchronization
+
+Scroll synchronization is always active for two-pane comparisons:
+
+1. Renderer indexes unique element IDs, named anchors, and normalized headings once per document layout.
+2. Scroll events identify surrounding anchors and progress between them.
+3. Matching target anchors map corresponding content; progress is interpolated between matching pairs.
+4. A single matching anchor preserves local pixel offset.
+5. Missing anchors fall back to normalized horizontal and vertical scroll progress.
+6. Programmatic target scrolling is suppressed from feeding back into source pane.
+
+Anchor indexes rebuild after relevant DOM or layout changes and are capped to avoid unbounded work on hostile documents.
+
+Design follows established diff-view behavior: CodeMirror aligns unchanged content in merge views, while Monaco exposes paired editor scroll and diff APIs rather than recommending raw document-pixel coupling.
+
+- [CodeMirror merge view reference](https://codemirror.net/docs/ref/#merge.MergeView)
+- [Monaco diff editor API](https://microsoft.github.io/monaco-editor/typedoc/interfaces/editor.IDiffEditor.html)
+- [Monaco editor scroll API](https://microsoft.github.io/monaco-editor/typedoc/interfaces/editor_editor_api.editor.ICodeEditor.html)
 
 ## Development
 

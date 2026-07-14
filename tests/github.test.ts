@@ -8,6 +8,7 @@ import {
   fetchRepositoryBytes,
   fetchRepositoryFile,
   parseBlobUrl,
+  parseHtmlDiffUrl,
   parsePrFilesUrl,
 } from '../utils/github';
 import type { RepoRef } from '../utils/types';
@@ -61,6 +62,48 @@ describe('repository fetching', () => {
     ).toEqual({ owner: 'acme', repo: 'reports', pullNumber: '42' });
     expect(
       parsePrFilesUrl('https://github.com/acme/reports/pull/42/commits'),
+    ).toBeNull();
+    expect(
+      parseHtmlDiffUrl('https://github.com/acme/reports/pull/42/changes'),
+    ).toEqual({
+      kind: 'pull',
+      owner: 'acme',
+      repo: 'reports',
+      pullNumber: '42',
+    });
+    expect(
+      parseHtmlDiffUrl(
+        'https://github.com/acme/reports/commit/0123456789abcdef0123456789abcdef01234567',
+      ),
+    ).toEqual({
+      kind: 'commit',
+      owner: 'acme',
+      repo: 'reports',
+      head: '0123456789abcdef0123456789abcdef01234567',
+    });
+    expect(
+      parseHtmlDiffUrl(
+        'https://github.com/acme/reports/pull/42/changes/0123456789abcdef0123456789abcdef01234567',
+      ),
+    ).toEqual({
+      kind: 'commit',
+      owner: 'acme',
+      repo: 'reports',
+      head: '0123456789abcdef0123456789abcdef01234567',
+    });
+    expect(
+      parseHtmlDiffUrl(
+        'https://github.com/acme/reports/compare/release%2Fv1...release%2Fv2',
+      ),
+    ).toEqual({
+      kind: 'compare',
+      owner: 'acme',
+      repo: 'reports',
+      base: 'release/v1',
+      head: 'release/v2',
+    });
+    expect(
+      parseHtmlDiffUrl('https://github.com/acme/reports/releases/tag/v2'),
     ).toBeNull();
   });
 

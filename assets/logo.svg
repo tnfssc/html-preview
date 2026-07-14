@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="GitHub HTML Preview logo">
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="#07142e"/>
+  <path d="M398 294 218 512l180 218" fill="none" stroke="#f8fafc" stroke-width="92" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="m626 294 180 218-180 218" fill="none" stroke="#f8fafc" stroke-width="92" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M452 376c0-24 27-39 47-26l205 130c24 15 24 49 0 64L499 674c-20 13-47-2-47-26Z" fill="#b7ff00"/>
+</svg>

@@ -32,12 +32,9 @@ test('current GitHub blob UI renders repository CSS in a sandboxed preview', asy
     await preview.click();
 
     const container = page.locator('.gh-html-preview-container');
-    await expect(container.getByRole('status')).toHaveText(
-      /Executable preview ready|resource issues/,
-      {
+    await expect(container.getByRole('status')).toBeHidden({
       timeout: liveTimeout,
-      },
-    );
+    });
     const iframe = container.locator('iframe[title="Executable HTML preview"]');
     await expect(iframe).toHaveAttribute('sandbox', 'allow-scripts', {
       timeout: liveTimeout,
@@ -89,72 +86,29 @@ test('current GitHub blob UI renders repository CSS in a sandboxed preview', asy
   }
 });
 
-test('current GitHub PR UI renders, controls, and reloads executable HTML diffs', async () => {
+test('current GitHub PR UI renders lightweight executable HTML diffs', async () => {
   test.setTimeout(120_000);
   const { context, page } = await launchWithExtension();
   try {
     await page.goto(prUrl, { waitUntil: 'commit', timeout: liveTimeout });
-    const preview = page.getByRole('link', {
-      name: `Open after preview for ${prHtmlPath} in new tab`,
-    });
-    await expect(preview).toBeVisible({ timeout: liveTimeout });
-    await expect
-      .poll(() => preview.getAttribute('href'), { timeout: liveTimeout })
-      .toMatch(/^chrome-extension:\/\/[^/]+\/preview\.html\?/);
-    const previewUrl = new URL((await preview.getAttribute('href')) ?? '');
-    expect(previewUrl.pathname).toBe('/preview.html');
-    expect(Object.fromEntries(previewUrl.searchParams)).toEqual({
-      ...prHead,
-      path: prHtmlPath,
-    });
-    const fullPreviewPromise = context.waitForEvent('page', {
-      timeout: liveTimeout,
-    });
-    await preview.click();
-    const fullPreview = await fullPreviewPromise;
-    await expect(fullPreview.getByRole('status')).toHaveText(
-      'Executable preview ready.',
-      { timeout: liveTimeout },
-    );
-    const executableFrame = fullPreview
-      .locator('iframe[title="Executable HTML preview"]')
-      .contentFrame();
-    await expect(
-      executableFrame.getByRole('heading', { name: 'Number guessing game' }),
-    ).toBeVisible({ timeout: liveTimeout });
-    await executableFrame.locator('.guessField').fill('42', {
-      timeout: liveTimeout,
-    });
-    await executableFrame.locator('.guessSubmit').click({
-      timeout: liveTimeout,
-    });
-    await expect(executableFrame.locator('.guesses')).toHaveText(
-      'Previous guesses: 42',
-      { timeout: liveTimeout },
-    );
-    await fullPreview.close();
-
     const htmlDiff = page.locator(`[data-path="${prHtmlPath}"]`).locator('..');
     const richButton = htmlDiff.getByRole('tab', {
       name: 'Display before and after previews',
     });
     await expect(richButton).toHaveCount(1, { timeout: liveTimeout });
-    await expect(preview).toHaveCount(1, { timeout: liveTimeout });
     await expect(
       htmlDiff.getByRole('tab', { name: 'Display code diff' }),
-    ).toHaveCount(1, { timeout: liveTimeout });
-    await expect(
-      htmlDiff.getByRole('tab', { name: 'Display after preview' }),
     ).toHaveCount(1, { timeout: liveTimeout });
     await expect(htmlDiff.locator('.js-file-content')).toBeVisible({
       timeout: liveTimeout,
     });
     await richButton.click();
     const richContainer = htmlDiff.locator('.gh-html-preview-pr-rich');
-    await expect(richContainer.getByRole('status')).toHaveText(
-      'Before and after ready',
-      { timeout: liveTimeout },
-    );
+    await expect(richContainer.getByRole('status')).toBeHidden({
+      timeout: liveTimeout,
+    });
+    await expect(richContainer.getByRole('button')).toHaveCount(0);
+    await expect(richContainer.getByRole('link')).toHaveCount(0);
     const beforeIframe = richContainer.locator(
       `iframe[title="Before HTML preview for ${prHtmlPath}"]`,
     );
@@ -213,71 +167,6 @@ test('current GitHub PR UI renders, controls, and reloads executable HTML diffs'
       })
       .toBeGreaterThan(300);
 
-    const sync = richContainer.getByRole('checkbox', {
-      name: 'Synchronize preview scrolling',
-    });
-    await expect(sync).toBeChecked({ timeout: liveTimeout });
-    await sync.uncheck({ timeout: liveTimeout });
-    const unsyncedY = await afterPageFrame!.evaluate(() => scrollY);
-    await beforePageFrame!.evaluate(() => scrollTo(0, 0));
-    await page.waitForTimeout(300);
-    expect(await afterPageFrame!.evaluate(() => scrollY)).toBe(unsyncedY);
-
-    const viewport = richContainer.getByRole('combobox', {
-      name: 'Preview viewport width',
-    });
-    await viewport.selectOption('390', { timeout: liveTimeout });
-    await expect(beforeIframe.locator('..')).toHaveCSS('width', '390px', {
-      timeout: liveTimeout,
-    });
-    await expect(afterIframe.locator('..')).toHaveCSS('width', '390px', {
-      timeout: liveTimeout,
-    });
-
-    await richContainer.getByRole('button', { name: 'Reload' }).click();
-    await expect(richContainer.getByRole('status')).toHaveText(
-      'Before and after ready',
-      { timeout: liveTimeout },
-    );
-    await expect(beforeIframe).toBeVisible({ timeout: liveTimeout });
-    await expect(afterIframe).toBeVisible({ timeout: liveTimeout });
-    await expect(
-      beforeIframe.contentFrame().getByRole('heading', {
-        name: 'Number guessing game',
-      }),
-    ).toBeVisible({ timeout: liveTimeout });
-    await expect(
-      afterIframe.contentFrame().getByRole('heading', {
-        name: 'Number guessing game',
-      }),
-    ).toBeVisible({ timeout: liveTimeout });
-
-    await htmlDiff
-      .getByRole('tab', { name: 'Display after preview' })
-      .click();
-    await expect(beforeIframe).toBeHidden({ timeout: liveTimeout });
-    await expect(afterIframe).toBeVisible({ timeout: liveTimeout });
-    await expect(richContainer.getByRole('status')).toHaveText('After ready', {
-      timeout: liveTimeout,
-    });
-    await richContainer.getByRole('button', { name: 'Full screen' }).click();
-    await expect
-      .poll(
-        () =>
-          page.evaluate(() =>
-            document.fullscreenElement?.classList.contains(
-              'gh-html-preview-pr-rich',
-            ),
-          ),
-        { timeout: liveTimeout },
-      )
-      .toBe(true);
-    await page.evaluate(() => document.exitFullscreen());
-    await expect
-      .poll(() => page.evaluate(() => document.fullscreenElement === null), {
-        timeout: liveTimeout,
-      })
-      .toBe(true);
 
     await htmlDiff
       .getByRole('tab', { name: 'Display code diff' })

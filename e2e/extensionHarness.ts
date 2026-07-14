@@ -16,6 +16,12 @@ export async function launchWithExtension(): Promise<{
     `/tmp/playwright-gh-html-preview-${randomUUID()}`,
     {
       headless: false,
+      recordVideo: process.env.RECORD_E2E
+        ? {
+            dir: process.env.E2E_VIDEO_DIR ?? 'test-results/e2e-videos',
+            size: { width: 1280, height: 720 },
+          }
+        : undefined,
       args: [
         '--headless=new',
         `--disable-extensions-except=${pathToExtension}`,

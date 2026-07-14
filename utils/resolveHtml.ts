@@ -392,9 +392,6 @@ async function resolvePrivateSandboxDocument(
   sourcePath: string,
   loader: ResourceLoader,
 ): Promise<void> {
-  if (!loader.githubToken) {
-    throw new Error('Private repository access requires a saved GitHub token.');
-  }
   doc.querySelector('base')?.remove();
 
   const stylesheetLinks = Array.from(

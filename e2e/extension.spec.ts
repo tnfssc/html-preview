@@ -916,6 +916,108 @@ test('GitHub SPA navigation mounts diff controls without a location event', asyn
   }
 });
 
+test('organization SSO falls back to embedded PR metadata and GitHub session raw files', async () => {
+  const { context, page } = await launchWithExtension();
+  const filePath = 'enterprise/report.html';
+  const base = 'b'.repeat(40);
+  const head = 'a'.repeat(40);
+  const prUrl = 'https://github.com/acme/reports/pull/61/changes';
+  const embedded = JSON.stringify({
+    payload: {
+      pullRequestsChangesRoute: {
+        comparison: { fullDiff: { baseOid: base, headOid: head } },
+        pullRequest: {
+          comparison: { baseOid: base, headOid: head },
+          headRepositoryOwnerLogin: 'acme',
+          headRepositoryName: 'reports',
+        },
+        diffContents: [
+          {
+            path: filePath,
+            status: 'MODIFIED',
+            oldTreeEntry: { path: filePath },
+          },
+        ],
+      },
+    },
+  }).replaceAll('<', '\\u003c');
+  const pageHtml = githubReactPrFixture(filePath).replace(
+    '</body>',
+    `<script type="application/json" data-target="react-app.embeddedData">${embedded}</script></body>`,
+  );
+  const sessionRequests: string[] = [];
+  try {
+    await context.route('**/*', async (route) => {
+      const url = route.request().url();
+      if (url === prUrl) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: pageHtml,
+        });
+        return;
+      }
+      if (
+        url === 'https://api.github.com/repos/acme/reports/pulls/61' ||
+        url ===
+          'https://api.github.com/repos/acme/reports/pulls/61/files?per_page=100'
+      ) {
+        await route.fulfill({ status: 404, json: { message: 'Not Found' } });
+        return;
+      }
+      const sessionRaw =
+        /^https:\/\/github\.com\/acme\/reports\/raw\/([0-9a-f]{40})\/(.+)$/.exec(
+          url,
+        );
+      if (sessionRaw) {
+        sessionRequests.push(sessionRaw[1]);
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/plain',
+          body: `<!doctype html><html><body><h1>${sessionRaw[1] === base ? 'Enterprise before' : 'Enterprise after'}</h1></body></html>`,
+        });
+        return;
+      }
+      await route.abort();
+    });
+    await page.goto(prUrl);
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () => document.querySelectorAll('.gh-html-preview-pr-controls').length,
+        ),
+      )
+      .toBe(1);
+    await page.evaluate((path) => {
+      const region = Array.from(
+        document.querySelectorAll<HTMLElement>('[role="region"]'),
+      ).find((candidate) => candidate.textContent?.includes(path));
+      Array.from(
+        region?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? [],
+      )
+        .find((button) => button.textContent?.trim() === 'Preview')
+        ?.click();
+    }, filePath);
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            document
+              .querySelector(
+                '.gh-html-preview-pr-controls [role="tab"]:last-child',
+              )
+              ?.getAttribute('aria-selected'),
+        ),
+      )
+      .toBe('true');
+    await expect
+      .poll(() => sessionRequests.sort())
+      .toEqual([head, base].sort());
+  } finally {
+    await context.close();
+  }
+});
+
 test('commit pages render HTML fallbacks when GitHub omits large diffs', async () => {
   const { context, page } = await launchWithExtension();
   const head = 'a'.repeat(40);

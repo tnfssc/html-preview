@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   buildContentsApiUrl,
+  buildGitHubSessionRawUrl,
   buildJsdelivrUrl,
   buildRawUrl,
   fetchRepositoryBytes,
@@ -24,6 +25,7 @@ const originalFetch = globalThis.fetch;
 afterEach(() => {
   globalThis.fetch = originalFetch;
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe('repository fetching', () => {
@@ -223,7 +225,7 @@ describe('repository fetching', () => {
     ]);
   });
 
-  it('rejects private access without a token before making a request', async () => {
+  it('rejects private access without a token or GitHub browser session', async () => {
     const fetchMock = vi.fn();
     globalThis.fetch = fetchMock as typeof fetch;
 
@@ -234,7 +236,9 @@ describe('repository fetching', () => {
         new AbortController().signal,
         { privateRepo: true },
       ),
-    ).rejects.toThrow('Private repository access requires a saved GitHub token.');
+    ).rejects.toThrow(
+      'Private repository access requires an active GitHub browser session or a saved GitHub token.',
+    );
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -253,6 +257,60 @@ describe('repository fetching', () => {
     expect(fetchMock).toHaveBeenCalledWith(
       buildRawUrl(repoRef),
       expect.not.objectContaining({ headers: expect.anything() }),
+    );
+  });
+
+  it('uses the signed-in GitHub session for private repository content', async () => {
+    vi.stubGlobal(
+      'location',
+      new URL('https://github.com/acme/reports/blob/main/report.html'),
+    );
+    const response = new Response('<h1>Session file</h1>', {
+      status: 200,
+      headers: { 'content-type': 'text/plain; charset=utf-8' },
+    });
+    Object.defineProperty(response, 'url', {
+      value:
+        'https://raw.githubusercontent.com/acme/reports/main/report.html?token=redacted',
+    });
+    const fetchMock = vi.fn().mockResolvedValue(response);
+    vi.stubGlobal('fetch', fetchMock);
+    const resource = await fetchRepositoryFile(
+      repoRef,
+      new AbortController().signal,
+      { privateRepo: true, token: null },
+    );
+    expect(resource.text).toBe('<h1>Session file</h1>');
+    expect(resource.authenticated).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith(
+      buildGitHubSessionRawUrl(repoRef),
+      expect.objectContaining({
+        credentials: 'same-origin',
+        redirect: 'follow',
+      }),
+    );
+  });
+
+  it('rejects session responses that do not finish on GitHub raw content', async () => {
+    vi.stubGlobal(
+      'location',
+      new URL('https://github.com/acme/reports/blob/main/report.html'),
+    );
+    const response = new Response('<html>Sign in</html>', {
+      status: 200,
+      headers: { 'content-type': 'text/html' },
+    });
+    Object.defineProperty(response, 'url', {
+      value: 'https://github.com/login',
+    });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response));
+    await expect(
+      fetchRepositoryFile(repoRef, new AbortController().signal, {
+        privateRepo: true,
+        token: null,
+      }),
+    ).rejects.toThrow(
+      'Private repository access requires an active GitHub browser session or a saved GitHub token.',
     );
   });
 

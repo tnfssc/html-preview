@@ -344,16 +344,18 @@ describe('sandbox preview', () => {
     expect(result.resources.failed).toBe(0);
   });
 
-  it('requires a saved token before packaging private preview resources', async () => {
+  it('reports unavailable private resources without a token or GitHub session', async () => {
     const fetchMock = vi.fn();
     globalThis.fetch = fetchMock as typeof fetch;
 
-    await expect(
-      resolveHtml('<img src="private.png">', {
-        target: 'sandbox-private',
-        repoRef,
-      }),
-    ).rejects.toThrow('Private repository access requires a saved GitHub token.');
+    const result = await resolveHtml('<img src="private.png">', {
+      target: 'sandbox-private',
+      repoRef,
+    });
+    expect(result.resources.failed).toBe(1);
+    expect(result.diagnostics[0]?.message).toContain(
+      'active GitHub browser session or a saved GitHub token',
+    );
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

@@ -156,7 +156,8 @@ export default function App(): React.JSX.Element {
         <strong>How to use</strong>
         <p>
           Open an .html or .htm file on GitHub and choose Preview beside Code.
-          On a pull request, choose Before &amp; after or After preview.
+          Use the same Preview control on pull requests, commits, and
+          comparisons.
         </p>
       </div>
 
@@ -166,6 +167,12 @@ export default function App(): React.JSX.Element {
           Use a fine-grained token with read-only Contents, Metadata, and Pull
           requests access for selected repositories. Token stays in local
           extension storage.
+        </p>
+        <p>
+          Organization repositories may require administrator approval or SSO
+          authorization. While viewing GitHub, the extension can fall back to
+          your signed-in browser session without exposing session cookies to
+          preview content.
         </p>
         <a
           className="token-link"

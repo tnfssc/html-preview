@@ -341,6 +341,8 @@ async function fetchDiffComparison(
   if (route.kind !== 'pull') {
     return fetchRevisionComparison(route, signal, githubToken);
   }
+  const embedded = parseEmbeddedPullComparison(route);
+  if (embedded) return embedded;
   const url = `https://api.github.com/repos/${encodeURIComponent(route.owner)}/${encodeURIComponent(route.repo)}/pulls/${route.pullNumber}`;
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
@@ -360,7 +362,15 @@ async function fetchDiffComparison(
     referrerPolicy: 'no-referrer',
     headers,
   });
-  if (!response.ok) throw new Error(`GitHub API returned HTTP ${response.status}`);
+  if (!response.ok) {
+    const embedded = parseEmbeddedPullComparison(route);
+    if (embedded) return embedded;
+    throw new Error(
+      response.status === 404
+        ? 'GitHub API returned HTTP 404. Authorize the saved token for organization SSO, approve repository access, or sign into the organization SSO in this GitHub tab.'
+        : `GitHub API returned HTTP ${response.status}`,
+    );
+  }
 
   const data = (await response.json()) as unknown;
   if (typeof data !== 'object' || data === null || Array.isArray(data)) {
@@ -377,23 +387,33 @@ async function fetchRevisionComparison(
   signal: AbortSignal,
   githubToken: string | null,
 ): Promise<DiffComparison> {
-  const repository = await fetchGitHubApiRecord(
-    `https://api.github.com/repos/${encodeURIComponent(route.owner)}/${encodeURIComponent(route.repo)}`,
-    signal,
-    githubToken,
-    'repository metadata',
-  );
-  const privateRepo = repository.private === true;
   const endpoint =
     route.kind === 'commit'
       ? `commits/${encodeURIComponent(route.head)}`
       : `compare/${encodeURIComponent(route.base)}...${encodeURIComponent(route.head)}`;
-  const data = await fetchGitHubApiRecord(
-    `https://api.github.com/repos/${encodeURIComponent(route.owner)}/${encodeURIComponent(route.repo)}/${endpoint}`,
-    signal,
-    githubToken,
-    `${route.kind} metadata`,
-  );
+  let repository: Record<string, unknown>;
+  let data: Record<string, unknown>;
+  try {
+    [repository, data] = await Promise.all([
+      fetchGitHubApiRecord(
+        `https://api.github.com/repos/${encodeURIComponent(route.owner)}/${encodeURIComponent(route.repo)}`,
+        signal,
+        githubToken,
+        'repository metadata',
+      ),
+      fetchGitHubApiRecord(
+        `https://api.github.com/repos/${encodeURIComponent(route.owner)}/${encodeURIComponent(route.repo)}/${endpoint}`,
+        signal,
+        githubToken,
+        `${route.kind} metadata`,
+      ),
+    ]);
+  } catch (error) {
+    const embedded = await fetchSessionRevisionComparison(route, signal);
+    if (embedded) return embedded;
+    throw error;
+  }
+  const privateRepo = repository.private === true;
 
   let baseSha: string;
   let headSha: string;
@@ -422,6 +442,92 @@ async function fetchRevisionComparison(
   return { base: side(baseSha), head: side(headSha) };
 }
 
+async function fetchSessionRevisionComparison(
+  route: Exclude<HtmlDiffRoute, { kind: 'pull' }>,
+  signal: AbortSignal,
+): Promise<DiffComparison | null> {
+  if (location.origin !== 'https://github.com') return null;
+  const refs =
+    route.kind === 'commit'
+      ? [route.head]
+      : [route.base, route.head];
+  const revisions = await Promise.all(
+    refs.map((ref) =>
+      fetchSessionCommitMetadata(route.owner, route.repo, ref, signal),
+    ),
+  );
+  if (revisions.some((revision) => revision === null)) return null;
+  const side = (sha: string): DiffSide => ({
+    owner: route.owner,
+    repo: route.repo,
+    sha,
+    privateRepo: true,
+  });
+  if (route.kind === 'commit') {
+    const commit = revisions[0];
+    const parent = commit?.parents[0];
+    if (!commit || !parent) return null;
+    return { base: side(parent), head: side(commit.oid) };
+  }
+  const base = revisions[0];
+  const head = revisions[1];
+  if (!base || !head) return null;
+  return { base: side(base.oid), head: side(head.oid) };
+}
+
+async function fetchSessionCommitMetadata(
+  owner: string,
+  repo: string,
+  ref: string,
+  signal: AbortSignal,
+): Promise<{ oid: string; parents: string[] } | null> {
+  try {
+    const response = await fetch(
+      `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commit/${encodeURIComponent(ref)}`,
+      {
+        signal,
+        credentials: 'same-origin',
+        redirect: 'follow',
+        referrerPolicy: 'same-origin',
+      },
+    );
+    if (
+      !response.ok ||
+      new URL(response.url).origin !== 'https://github.com'
+    ) {
+      return null;
+    }
+    const documentNode = new DOMParser().parseFromString(
+      await response.text(),
+      'text/html',
+    );
+    const script = documentNode.querySelector(
+      'script[data-target="react-app.embeddedData"]',
+    );
+    if (!script?.textContent) return null;
+    const root = asRecord(JSON.parse(script.textContent));
+    const payload = asRecord(root?.payload);
+    const commit = asRecord(payload?.commit);
+    const oid = commit?.oid;
+    const parents = commit?.parents;
+    if (
+      typeof oid !== 'string' ||
+      !/^[0-9a-f]{40}$/i.test(oid) ||
+      !Array.isArray(parents)
+    ) {
+      return null;
+    }
+    const validParents = parents.filter(
+      (parent): parent is string =>
+        typeof parent === 'string' && /^[0-9a-f]{40}$/i.test(parent),
+    );
+    return { oid, parents: validParents };
+  } catch (error) {
+    if (signal.aborted) throw error;
+    return null;
+  }
+}
+
 async function fetchGitHubApiRecord(
   url: string,
   signal: AbortSignal,
@@ -441,7 +547,11 @@ async function fetchGitHubApiRecord(
     headers,
   });
   if (!response.ok) {
-    throw new Error(`GitHub ${label} API returned HTTP ${response.status}.`);
+    throw new Error(
+      response.status === 404
+        ? `GitHub ${label} API returned HTTP 404. Authorize the saved token for organization SSO, approve repository access, or sign into the organization SSO in this GitHub tab.`
+        : `GitHub ${label} API returned HTTP ${response.status}.`,
+    );
   }
   const data = (await response.json()) as unknown;
   if (typeof data !== 'object' || data === null || Array.isArray(data)) {
@@ -493,6 +603,123 @@ function parsePullSide(value: unknown, label: 'base' | 'head'): DiffSide {
     sha,
     privateRepo: (repoValue as Record<string, unknown>).private === true,
   };
+}
+
+function parseEmbeddedPullComparison(
+  route: Extract<HtmlDiffRoute, { kind: 'pull' }>,
+): DiffComparison | null {
+  const data = readEmbeddedPullChangesRoute();
+  if (!data) return null;
+  const pullRequest = asRecord(data.pullRequest);
+  const routeComparison = asRecord(data.comparison);
+  const comparison =
+    asRecord(pullRequest?.comparison) ??
+    asRecord(routeComparison?.fullDiff);
+  const baseSha = comparison?.baseOid;
+  const headSha = comparison?.headOid;
+  const headOwner = pullRequest?.headRepositoryOwnerLogin;
+  const headRepo = pullRequest?.headRepositoryName;
+  if (
+    typeof baseSha !== 'string' ||
+    typeof headSha !== 'string' ||
+    typeof headOwner !== 'string' ||
+    typeof headRepo !== 'string' ||
+    !/^[0-9a-f]{40}$/i.test(baseSha) ||
+    !/^[0-9a-f]{40}$/i.test(headSha)
+  ) {
+    return null;
+  }
+  return {
+    base: {
+      owner: route.owner,
+      repo: route.repo,
+      sha: baseSha,
+      privateRepo: true,
+    },
+    head: {
+      owner: headOwner,
+      repo: headRepo,
+      sha: headSha,
+      privateRepo: true,
+    },
+  };
+}
+
+function readEmbeddedPullChangesRoute(): Record<string, unknown> | null {
+  for (const script of document.querySelectorAll(
+    'script[data-target="react-app.embeddedData"]',
+  )) {
+    if (!script.textContent?.includes('"pullRequestsChangesRoute"')) continue;
+    try {
+      const root = asRecord(JSON.parse(script.textContent));
+      const payload = asRecord(root?.payload);
+      const route = asRecord(payload?.pullRequestsChangesRoute);
+      if (route) return route;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function parseEmbeddedPullFiles(): DiffFileInfo[] {
+  const data = readEmbeddedPullChangesRoute();
+  const contents = data?.diffContents;
+  if (!Array.isArray(contents)) return [];
+  return contents.flatMap((value): DiffFileInfo[] => {
+    const item = asRecord(value);
+    const path = item?.path;
+    const status = item?.status;
+    if (typeof path !== 'string' || typeof status !== 'string') return [];
+    const oldEntry = asRecord(item?.oldTreeEntry);
+    const previousPath =
+      typeof oldEntry?.path === 'string' && oldEntry.path !== path
+        ? oldEntry.path
+        : null;
+    return [
+      {
+        filename: path,
+        previousFilename: previousPath,
+        status: status.toLowerCase(),
+      },
+    ];
+  });
+}
+
+function parseEmbeddedCommitFiles(): DiffFileInfo[] {
+  for (const script of document.querySelectorAll(
+    'script[data-target="react-app.embeddedData"]',
+  )) {
+    if (!script.textContent?.includes('"diffEntryData"')) continue;
+    try {
+      const root = asRecord(JSON.parse(script.textContent));
+      const payload = asRecord(root?.payload);
+      const entries = payload?.diffEntryData;
+      if (!Array.isArray(entries)) continue;
+      return entries.flatMap((value): DiffFileInfo[] => {
+        const item = asRecord(value);
+        const path = item?.path;
+        const status = item?.status;
+        if (typeof path !== 'string' || typeof status !== 'string') return [];
+        return [
+          {
+            filename: path,
+            previousFilename: null,
+            status: status.toLowerCase(),
+          },
+        ];
+      });
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
 }
 
 function findDiffTargets(): DiffTarget[] {
@@ -1181,9 +1408,6 @@ async function renderComparisonSide(
 ): Promise<boolean> {
   const area = sideName === 'base' ? state.baseArea : state.headArea;
   try {
-    if (side.privateRepo && !githubToken) {
-      throw new Error('Private repository access requires a saved GitHub token.');
-    }
     let path = state.target.path;
     let repoRef = sideRepoRef(side, path);
     let file;
@@ -1393,7 +1617,18 @@ async function fetchDiffFiles(
     headers,
   });
   if (!response.ok) {
-    throw new Error(`GitHub diff files API returned HTTP ${response.status}.`);
+    const embedded =
+      route.kind === 'pull'
+        ? parseEmbeddedPullFiles()
+        : route.kind === 'commit'
+          ? parseEmbeddedCommitFiles()
+          : [];
+    if (embedded.length > 0) return embedded;
+    throw new Error(
+      response.status === 404
+        ? 'GitHub diff files API returned HTTP 404. Authorize the saved token for organization SSO, approve repository access, or sign into the organization SSO in this GitHub tab.'
+        : `GitHub diff files API returned HTTP ${response.status}.`,
+    );
   }
   const data = (await response.json()) as unknown;
   const files =

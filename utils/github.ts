@@ -224,6 +224,13 @@ export function buildRawUrl(repoRef: RepoRef): string {
   return `https://raw.githubusercontent.com/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}/${encodeURIComponent(repoRef.ref)}/${encodePath(repoRef.path)}`;
 }
 
+export function buildGitHubSessionRawUrl(
+  repoRef: RepoRef,
+  path = repoRef.path,
+): string {
+  return `https://github.com/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}/raw/${encodeURIComponent(repoRef.ref)}/${encodePath(path)}`;
+}
+
 export function buildJsdelivrUrl(
   repoRef: Pick<RepoRef, 'owner' | 'repo' | 'ref'>,
   assetPath: string,
@@ -261,9 +268,7 @@ export async function fetchRepositoryBytes(
   options: RepositoryFetchOptions = {},
 ): Promise<RepositoryBytes> {
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_FILE_BYTES;
-  if (options.privateRepo && !options.token) {
-    throw new Error('Private repository access requires a saved GitHub token.');
-  }
+  let publicStatus: number | null = null;
 
   if (!options.privateRepo) {
     debugLog('github', 'fetch-public', {
@@ -291,9 +296,36 @@ export async function fetchRepositoryBytes(
       });
       return resource;
     }
-    if (!options.token || ![401, 403, 404].includes(publicResponse.status)) {
+    publicStatus = publicResponse.status;
+    if (![401, 403, 404].includes(publicResponse.status)) {
       throw new Error(`Public raw file returned HTTP ${publicResponse.status}.`);
     }
+    if (!options.token) {
+      const sessionResource = await fetchViaGitHubSession(
+        repoRef,
+        path,
+        maxBytes,
+        signal,
+      );
+      if (sessionResource) return sessionResource;
+      throw new Error(`Public raw file returned HTTP ${publicResponse.status}.`);
+    }
+  }
+
+  if (!options.token) {
+    const sessionResource = await fetchViaGitHubSession(
+      repoRef,
+      path,
+      maxBytes,
+      signal,
+    );
+    if (sessionResource) return sessionResource;
+    if (options.privateRepo) {
+      throw new Error(
+        'Private repository access requires an active GitHub browser session or a saved GitHub token.',
+      );
+    }
+    throw new Error(`Public raw file returned HTTP ${publicStatus ?? 404}.`);
   }
 
   debugLog('github', 'fetch-authenticated', {
@@ -314,13 +346,25 @@ export async function fetchRepositoryBytes(
     },
   });
   if (!response.ok) {
+    if ([401, 403, 404].includes(response.status)) {
+      const sessionResource = await fetchViaGitHubSession(
+        repoRef,
+        path,
+        maxBytes,
+        signal,
+      );
+      if (sessionResource) return sessionResource;
+    }
+    const sso = response.headers.get('x-github-sso');
     const message =
       response.status === 401
         ? 'GitHub rejected the saved token. Replace an expired or invalid token in extension settings.'
         : response.status === 403
-          ? 'GitHub denied repository access. Grant the saved token read-only Contents access to this repository.'
+          ? sso?.includes('required')
+            ? 'GitHub organization SSO must authorize the saved token. Use Configure SSO in GitHub token settings, or sign into the organization SSO in this GitHub tab.'
+            : 'GitHub denied repository access. Grant the saved token read-only Contents access and organization approval.'
           : response.status === 404
-            ? 'GitHub could not access this file. Confirm the token includes this repository and the file still exists.'
+            ? 'GitHub could not access this file. Confirm the token includes this repository, has organization SSO approval, or sign into the organization SSO in this GitHub tab.'
             : `GitHub private file API returned HTTP ${response.status}.`;
     const error = new Error(message);
     debugError('github', 'fetch-authenticated-failed', error, {
@@ -341,6 +385,77 @@ export async function fetchRepositoryBytes(
     bytes: resource.bytes.byteLength,
   });
   return resource;
+}
+
+async function fetchViaGitHubSession(
+  repoRef: RepoRef,
+  path: string,
+  maxBytes: number,
+  signal: AbortSignal,
+): Promise<RepositoryBytes | null> {
+  if (
+    typeof location === 'undefined' ||
+    location.origin !== 'https://github.com'
+  ) {
+    return null;
+  }
+  debugLog('github', 'fetch-session', {
+    owner: repoRef.owner,
+    repo: repoRef.repo,
+    path,
+  });
+  try {
+    const response = await fetch(
+      buildGitHubSessionRawUrl(repoRef, path),
+      {
+        signal,
+        credentials: 'same-origin',
+        redirect: 'follow',
+        referrerPolicy: 'same-origin',
+      },
+    );
+    if (
+      !response.ok ||
+      !isTrustedGitHubRawResponse(response)
+    ) {
+      await response.body?.cancel();
+      debugLog('github', 'fetch-session-unavailable', {
+        path,
+        status: response.status,
+      });
+      return null;
+    }
+    const resource = await readRepositoryResponse(
+      response,
+      maxBytes,
+      signal,
+      true,
+    );
+    debugLog('github', 'fetch-session-complete', {
+      path,
+      status: response.status,
+      bytes: resource.bytes.byteLength,
+    });
+    return resource;
+  } catch (error) {
+    if (signal.aborted) throw error;
+    debugError('github', 'fetch-session-failed', error, { path });
+    return null;
+  }
+}
+
+function isTrustedGitHubRawResponse(response: Response): boolean {
+  try {
+    const url = new URL(response.url);
+    if (url.origin === 'https://raw.githubusercontent.com') return true;
+    return (
+      url.origin === 'https://github.com' &&
+      /^\/[^/]+\/[^/]+\/raw\/.+/.test(url.pathname) &&
+      !response.headers.get('content-type')?.includes('text/html')
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function readRepositoryResponse(

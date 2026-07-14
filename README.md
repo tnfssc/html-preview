@@ -14,8 +14,28 @@ Chrome extension for running and comparing commit-pinned public and private `.ht
 - File collapse hides and restores active previews with GitHub's native card. Inline review comments stay visible in Preview while unrelated source rows remain hidden.
 - UI stays light: show only controls required for primary preview flow. Put necessary secondary actions in a kebab menu instead of persistent toolbars, panels, or explanatory sections.
 - Public repositories need no credentials.
-- Private access uses an optional fine-grained GitHub token stored in `chrome.storage.local`. Give it read-only **Contents**, **Metadata**, and **Pull requests** access only for selected repositories.
+- Private access prefers an optional fine-grained GitHub token stored in `chrome.storage.local`. Give it read-only **Contents**, **Metadata**, and **Pull requests** access only for selected repositories.
+- On `github.com`, SSO-protected repositories can fall back to the current signed-in GitHub browser session. The extension reads exact-ref raw responses in the content script, packages their bytes, and never opens background tabs.
 - Tokens are sent only as `Authorization` headers to `https://api.github.com`; they are never placed in URLs, preview HTML, logs, or release artifacts.
+
+## Enterprise organization SSO
+
+Preferred setup:
+
+1. Create a fine-grained token for selected repositories with read-only **Contents**, **Metadata**, and **Pull requests** access.
+2. Complete organization approval when GitHub requests it. Classic personal access tokens must use **Configure SSO**.
+3. Sign into the organization SSO in the same GitHub tab before opening Preview.
+
+When GitHub intentionally returns `404` to an API token without organization access, PR views recover base/head metadata from GitHub's embedded page data. Repository files then use GitHub's same-origin `/raw/<ref>/<path>` route with the existing browser session. GitHub may redirect that request to a short-lived signed `raw.githubusercontent.com` URL; the extension validates the response origin and packages only response bytes.
+
+Security boundaries:
+
+- Session cookies remain browser-managed and are never read by extension code.
+- Signed raw URLs are never placed in preview HTML, logs, storage, or diagnostics.
+- Login pages and other non-raw HTML responses are rejected.
+- Session fallback runs only inside a `https://github.com` content script.
+- Standalone extension preview pages still require an organization-approved token.
+- Self-hosted GitHub Enterprise Server domains are not currently matched; this fallback targets GitHub Enterprise Cloud organizations on `github.com`.
 
 ## Product requirements
 

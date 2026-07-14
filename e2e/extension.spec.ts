@@ -7,11 +7,6 @@ const rawBase = `https://raw.githubusercontent.com/acme/reports/${commit}`;
 const cdnBase = `https://cdn.jsdelivr.net/gh/acme/reports@${commit}`;
 const privateBlobUrl =
   'https://github.com/private-owner/private-repo/blob/main/report/index.html';
-const privateToken = 'github_pat_private_test';
-const privateApiBase =
-  'https://api.github.com/repos/private-owner/private-repo/contents';
-const privatePrUrl =
-  'https://github.com/private-owner/private-repo/pull/7/files';
 
 const previewHtml = `<!doctype html><html><head>
   <link rel="stylesheet" href="/assets/site.css">
@@ -222,7 +217,7 @@ test('full preview executes public repository scripts only inside sandbox', asyn
     await expect(fullPage).toHaveURL(
       new RegExp(`^chrome-extension://${extensionId}/preview\\.html\\?`),
     );
-    await expect(fullPage.getByRole('status')).toHaveText('Executable preview ready.');
+    await expect(fullPage.getByRole('status')).toHaveCount(0);
 
     const sandboxElement = await fullPage
       .locator('iframe[title="Executable HTML preview"]')
@@ -1023,7 +1018,22 @@ test('commit pages render HTML fallbacks when GitHub omits large diffs', async (
   const head = 'a'.repeat(40);
   const base = 'b'.repeat(40);
   const commitUrl = `https://github.com/acme/reports/commit/${head}`;
+  const baseCommitUrl = `https://github.com/acme/reports/commit/${base}`;
   const filteredPrUrl = `https://github.com/acme/reports/pull/52/changes/${head}`;
+  const compareUrl = `https://github.com/acme/reports/compare/${base}...${head}`;
+  const commitPage = `<!doctype html><html><body><main><h1>Large commit</h1></main><script type="application/json" data-target="react-app.embeddedData">${JSON.stringify(
+    {
+      payload: {
+        commit: { oid: head, parents: [base] },
+        repo: { private: true },
+        diffEntryData: [
+          { path: 'long-added.html', status: 'ADDED' },
+          { path: 'long-edited.html', status: 'MODIFIED' },
+          { path: 'long-removed.html', status: 'DELETED' },
+        ],
+      },
+    },
+  )}</script></body></html>`;
   const html = (label: string) =>
     `<!doctype html><html><body><h1>${label}</h1></body></html>`;
   try {
@@ -1033,30 +1043,44 @@ test('commit pages render HTML fallbacks when GitHub omits large diffs', async (
         await route.fulfill({
           status: 200,
           contentType: 'text/html',
-          body: '<!doctype html><html><body><main><h1>Large commit</h1></main></body></html>',
+          body: commitPage,
+        });
+        return;
+      }
+      if (url === baseCommitUrl) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: `<script type="application/json" data-target="react-app.embeddedData">${JSON.stringify(
+            { payload: { commit: { oid: base, parents: [] } } },
+          )}</script>`,
+        });
+        return;
+      }
+      if (url === compareUrl) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: githubReactPrFixture('long-edited.html'),
         });
         return;
       }
       if (url === 'https://api.github.com/repos/acme/reports') {
-        await route.fulfill({ status: 200, json: { private: false } });
+        await route.fulfill({ status: 404, json: { message: 'Not Found' } });
         return;
       }
       if (url === `https://api.github.com/repos/acme/reports/commits/${head}`) {
-        await route.fulfill({
-          status: 200,
-          json: {
-            sha: head,
-            parents: [{ sha: base }],
-            files: [
-              { filename: 'long-added.html', status: 'added' },
-              { filename: 'long-edited.html', status: 'modified' },
-              { filename: 'long-removed.html', status: 'removed' },
-            ],
-          },
-        });
+        await route.fulfill({ status: 404, json: { message: 'Not Found' } });
         return;
       }
-      const raw = /^https:\/\/raw\.githubusercontent\.com\/acme\/reports\/([^/]+)\/(.+)$/.exec(
+      if (
+        url ===
+        `https://api.github.com/repos/acme/reports/compare/${base}...${head}`
+      ) {
+        await route.fulfill({ status: 404, json: { message: 'Not Found' } });
+        return;
+      }
+      const raw = /^https:\/\/github\.com\/acme\/reports\/raw\/([^/]+)\/(.+)$/.exec(
         url,
       );
       if (raw) {
@@ -1070,7 +1094,7 @@ test('commit pages render HTML fallbacks when GitHub omits large diffs', async (
         }
         await route.fulfill({
           status: 200,
-          contentType: 'text/html',
+          contentType: 'text/plain',
           body: html(`${ref === base ? 'Base' : 'Head'} ${path}`),
         });
         return;
@@ -1111,6 +1135,16 @@ test('commit pages render HTML fallbacks when GitHub omits large diffs', async (
         name: 'Display before and after previews',
       }),
     ).toHaveCount(3);
+    await page.goto(compareUrl);
+    await page
+      .getByRole('tab', { name: 'Display before and after previews' })
+      .click();
+    await expect(
+      page.locator('iframe[title="Before HTML preview for long-edited.html"]'),
+    ).toHaveCount(1);
+    await expect(
+      page.locator('iframe[title="After HTML preview for long-edited.html"]'),
+    ).toHaveCount(1);
   } finally {
     await context.close();
   }
@@ -1264,78 +1298,41 @@ test('inline preview falls back to public raw source when embedded HTML is absen
   }
 });
 
-test('private blob and executable preview use local token without exposing it', async () => {
+test('private blob and full preview use only the signed-in GitHub session', async () => {
   const { context, page, extensionId } = await launchWithExtension();
-  const authenticatedRequests: Array<{
-    url: string;
-    authorization: string | null;
-  }> = [];
+  const sessionRequests: string[] = [];
+  const authorizationHeaders: string[] = [];
+  context.on('request', (request) => {
+    const authorization = request.headers().authorization;
+    if (authorization) authorizationHeaders.push(authorization);
+  });
   try {
-    await context.route('https://api.github.com/**', async (route) => {
+    await context.route('https://github.com/private-owner/private-repo/raw/**', async (route) => {
       const url = route.request().url();
-      const authorization = route.request().headers().authorization ?? null;
-      authenticatedRequests.push({ url, authorization });
-      if (url === 'https://api.github.com/user') {
-        await route.fulfill({
-          status: 200,
-          contentType: 'application/json',
-          body: JSON.stringify({ login: 'private-tester' }),
-        });
-        return;
-      }
-      if (
-        url ===
-        'https://api.github.com/repos/private-owner/private-repo/pulls/7'
-      ) {
-        await route.fulfill({
-          status: 200,
-          contentType: 'application/json',
-          body: JSON.stringify({
-            base: {
-              sha: commit,
-              repo: {
-                full_name: 'private-owner/private-repo',
-                private: true,
-              },
-            },
-            head: {
-              sha: commit,
-              repo: {
-                full_name: 'private-owner/private-repo',
-                private: true,
-              },
-            },
-          }),
-        });
-        return;
-      }
       const resources: Record<string, { body: string; type: string }> = {
-        [`${privateApiBase}/report/index.html?ref=${commit}`]: {
-          body: privatePreviewHtml,
-          type: 'text/html',
-        },
-        [`${privateApiBase}/assets/private.css?ref=${commit}`]: {
+        [`https://github.com/private-owner/private-repo/raw/${commit}/assets/private.css`]: {
           body: 'body { color: rgb(12, 34, 56) }',
           type: 'text/plain',
         },
-        [`${privateApiBase}/report/secret.png?ref=${commit}`]: {
+        [`https://github.com/private-owner/private-repo/raw/${commit}/report/secret.png`]: {
           body: 'secret-image',
           type: 'application/octet-stream',
         },
-        [`${privateApiBase}/report/classic.js?ref=${commit}`]: {
+        [`https://github.com/private-owner/private-repo/raw/${commit}/report/classic.js`]: {
           body: `document.querySelector('#classic-result').textContent = 'Classic executed';`,
           type: 'application/octet-stream',
         },
-        [`${privateApiBase}/report/main.js?ref=${commit}`]: {
+        [`https://github.com/private-owner/private-repo/raw/${commit}/report/main.js`]: {
           body: `import { value } from './dependency.js'; document.querySelector('#module-result').textContent = value;`,
           type: 'application/octet-stream',
         },
-        [`${privateApiBase}/report/dependency.js?ref=${commit}`]: {
+        [`https://github.com/private-owner/private-repo/raw/${commit}/report/dependency.js`]: {
           body: `export const value = 'Module executed';`,
           type: 'application/octet-stream',
         },
       };
       const resource = resources[url];
+      sessionRequests.push(url);
       await route.fulfill(
         resource
           ? {
@@ -1358,159 +1355,96 @@ test('private blob and executable preview use local token without exposing it', 
         ),
       });
     });
-    await context.route(privatePrUrl, async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/html',
-        body: githubPrFixture('report/index.html'),
-      });
+    const popup = await context.newPage();
+    await popup.goto(`chrome-extension://${extensionId}/popup.html`);
+    await popup.evaluate(() => {
+      const extensionChrome = (
+        globalThis as unknown as {
+          chrome: {
+            storage: {
+              local: {
+                set(value: Record<string, unknown>): Promise<void>;
+              };
+            };
+          };
+        }
+      ).chrome;
+      return extensionChrome.storage.local.set({ githubToken: 'legacy-token' });
     });
+    await popup.reload();
+    await expect(
+      popup.getByText('The extension never asks for or stores a personal access token.'),
+    ).toBeVisible();
+    expect(
+      await popup.evaluate(() => {
+        const extensionChrome = (
+          globalThis as unknown as {
+            chrome: {
+              storage: {
+                local: {
+                  get(key: string): Promise<Record<string, unknown>>;
+                };
+              };
+            };
+          }
+        ).chrome;
+        return extensionChrome.storage.local.get('githubToken');
+      }),
+    ).toEqual({});
+    await expect(popup.locator('input[type="password"]')).toHaveCount(0);
 
     await page.goto(privateBlobUrl, { waitUntil: 'domcontentloaded' });
     await page.getByRole('tab', { name: 'Preview' }).click();
     const container = page.locator('.gh-html-preview-container');
-    await expect(container.getByRole('alert')).toHaveText('Error');
-    await expect(container).toContainText(
-      'Private repository access requires a fine-grained GitHub token',
-    );
-
-    const popup = await context.newPage();
-    await popup.goto(`chrome-extension://${extensionId}/popup.html`);
-    const tokenCreationLink = popup.getByRole('link', {
-      name: 'Create fine-grained token',
-    });
-    await expect(tokenCreationLink).toHaveAttribute('target', '_blank');
-    const tokenCreationUrl = new URL(
-      (await tokenCreationLink.getAttribute('href')) ?? '',
-    );
-    expect(tokenCreationUrl.origin + tokenCreationUrl.pathname).toBe(
-      'https://github.com/settings/personal-access-tokens/new',
-    );
-    expect(Object.fromEntries(tokenCreationUrl.searchParams)).toEqual({
-      name: 'GitHub HTML Preview',
-      description:
-        'Read-only private repository access for GitHub HTML Preview',
-      contents: 'read',
-      metadata: 'read',
-      pull_requests: 'read',
-    });
-    const tokenInput = popup.getByLabel('Private repository access');
-    const saveToken = popup.getByRole('button', { name: 'Save token' });
-    await saveToken.click();
-    await expect(popup.getByRole('alert')).toHaveText(
-      'Enter a fine-grained GitHub token.',
-    );
-    await tokenInput.fill(`  ${privateToken}  `);
-    await popup.getByRole('button', { name: 'Save token' }).click();
-    await expect(popup.getByRole('status')).toContainText(
-      'Token saved',
-    );
-    await expect(tokenInput).toHaveCount(0);
-    await expect(popup.getByRole('button', { name: 'Replace' })).toBeVisible();
-    await expect(popup.getByRole('button', { name: 'Remove' })).toBeEnabled();
-
     await expect(container.getByRole('status')).toBeHidden();
-    const staticFrame = container
+    const inlineFrame = container
       .locator('iframe[title="Executable HTML preview"]')
       .contentFrame();
-    await expect(staticFrame.locator('#private-title')).toHaveText(
+    await expect(inlineFrame.locator('#private-title')).toHaveText(
       'Private report',
     );
-    await expect(staticFrame.locator('#private-image')).toHaveAttribute(
+    await expect(inlineFrame.locator('#private-image')).toHaveAttribute(
       'src',
       /^data:image\/png;base64,/,
     );
-    await expect(staticFrame.locator('#classic-result')).toHaveText(
+    await expect(inlineFrame.locator('#classic-result')).toHaveText(
       'Classic executed',
     );
-    await expect(staticFrame.locator('#module-result')).toHaveText(
+    await expect(inlineFrame.locator('#module-result')).toHaveText(
       'Module executed',
     );
+    expect(sessionRequests).toHaveLength(5);
+    expect(
+      await page
+        .getByRole('link', { name: 'Open full preview' })
+        .getAttribute('aria-disabled'),
+    ).toBeNull();
 
-    const popupPromise = context.waitForEvent('page');
+    const fullPagePromise = context.waitForEvent('page');
     await page.getByRole('link', { name: 'Open full preview' }).click();
-    const allowedFullPage = await popupPromise;
-    const privateBrowserErrors: string[] = [];
-    allowedFullPage.on('console', (message) => {
-      if (message.type() === 'error') privateBrowserErrors.push(message.text());
-    });
-    allowedFullPage.on('pageerror', (error) =>
-      privateBrowserErrors.push(error.message),
-    );
-    await expect(allowedFullPage.getByRole('status')).toHaveText(
-      'Executable preview ready.',
-    );
-    const sandbox = allowedFullPage
+    const fullPage = await fullPagePromise;
+    const fullFrame = fullPage
       .locator('iframe[title="Executable HTML preview"]')
       .contentFrame();
-    await expect(sandbox.locator('#classic-result')).toHaveText(
+    await expect(fullFrame.locator('#private-title')).toHaveText(
+      'Private report',
+    );
+    await expect(fullFrame.locator('#classic-result')).toHaveText(
       'Classic executed',
     );
-    const runtimeModuleUrl = await sandbox.locator('body').evaluate(
-      (body) =>
-        body.ownerDocument
-          .querySelector('script[type="module"][src]')
-          ?.getAttribute('src') ?? '',
-    );
-    const runtimeModuleSource = atob(
-      runtimeModuleUrl.slice(runtimeModuleUrl.indexOf(',') + 1),
-    );
-    expect(runtimeModuleSource).toContain(
-      'https://private-preview.invalid/report/dependency.js',
-    );
-    await expect.poll(() => privateBrowserErrors).toEqual([]);
-    await expect(sandbox.locator('#module-result')).toHaveText(
+    await expect(fullFrame.locator('#module-result')).toHaveText(
       'Module executed',
     );
-    expect(await allowedFullPage.content()).not.toContain(privateToken);
+    expect(await fullPage.content()).not.toContain('legacy-token');
     expect(
-      authenticatedRequests.every(
-        ({ url, authorization }) =>
-          url.startsWith('https://api.github.com/') &&
-          authorization === `Bearer ${privateToken}`,
+      sessionRequests.every((url) =>
+        url.startsWith('https://github.com/private-owner/private-repo/raw/'),
       ),
     ).toBe(true);
     expect(
-      authenticatedRequests.every(({ url }) => !url.includes(privateToken)),
-    ).toBe(true);
-
-    const prPage = await context.newPage();
-    await prPage.goto(privatePrUrl, { waitUntil: 'domcontentloaded' });
-    const privateDiff = prPage.locator(
-      '.file[data-path="report/index.html"]',
-    );
-    await privateDiff
-      .getByRole('tab', {
-        name: 'Display before and after previews',
-      })
-      .click();
-    const privateComparison = privateDiff.locator(
-      '.gh-html-preview-pr-rich',
-    );
-    await expect(privateComparison.getByRole('status')).toBeHidden();
-    await expect(
-      privateComparison
-        .locator('iframe[title^="Before HTML preview"]')
-        .contentFrame()
-        .locator('#private-title'),
-    ).toHaveText('Private report');
-    await expect(
-      privateComparison
-        .locator('iframe[title^="After HTML preview"]')
-        .contentFrame()
-        .locator('#private-title'),
-    ).toHaveText('Private report');
-
-    await popup.getByRole('button', { name: 'Remove' }).click();
-    await expect(popup.getByRole('status')).toHaveText(
-      'Private access removed.',
-    );
-    await expect(tokenInput).toHaveValue('');
-    await expect(popup.getByRole('button', { name: 'Remove' })).toBeDisabled();
-    await expect(container.getByRole('alert')).toHaveText('Error');
-    await expect(container).toContainText(
-      'Private repository access requires a fine-grained GitHub token',
-    );
+      sessionRequests.some((url) => url.includes('api.github.com')),
+    ).toBe(false);
+    expect(authorizationHeaders).toEqual([]);
   } finally {
     await context.close();
   }

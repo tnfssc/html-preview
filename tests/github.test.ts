@@ -2,7 +2,6 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  buildContentsApiUrl,
   buildGitHubSessionRawUrl,
   buildJsdelivrUrl,
   buildRawUrl,
@@ -43,9 +42,7 @@ describe('repository fetching', () => {
     expect(buildJsdelivrUrl(pullHead, 'assets/chart #1.js')).toBe(
       'https://cdn.jsdelivr.net/gh/fork%20owner/fork-repo@f00dbabe0123456789abcdef0123456789abcdef/assets/chart%20%231.js',
     );
-    expect(buildContentsApiUrl(pullHead)).toBe(
-      'https://api.github.com/repos/fork%20owner/fork-repo/contents/reports/April%20report/index.html?ref=f00dbabe0123456789abcdef0123456789abcdef',
-    );
+
   });
 
   it('parses encoded blob and PR files routes while rejecting adjacent GitHub routes', () => {
@@ -109,46 +106,6 @@ describe('repository fetching', () => {
     ).toBeNull();
   });
 
-  it('sends private token only to GitHub Contents API', async () => {
-    const fetchMock = vi.fn(
-      async (
-        _input: RequestInfo | URL,
-        _init?: RequestInit,
-      ): Promise<Response> =>
-        new Response('private bytes', {
-          status: 200,
-          headers: { 'content-type': 'application/octet-stream' },
-        }),
-    );
-    globalThis.fetch = fetchMock as typeof fetch;
-
-    const resource = await fetchRepositoryBytes(
-      repoRef,
-      'assets/private image.png',
-      new AbortController().signal,
-      { token: 'secret-token', privateRepo: true },
-    );
-
-    expect(new TextDecoder().decode(resource.bytes)).toBe('private bytes');
-    expect(resource.authenticated).toBe(true);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe(
-      'https://api.github.com/repos/private-owner/private-repo/contents/assets/private%20image.png?ref=0123456789abcdef0123456789abcdef01234567',
-    );
-    expect(String(url)).not.toContain('secret-token');
-    expect(init).toMatchObject({
-      credentials: 'omit',
-      redirect: 'error',
-      referrerPolicy: 'no-referrer',
-      headers: {
-        Accept: 'application/vnd.github.raw+json',
-        Authorization: 'Bearer secret-token',
-        'X-GitHub-Api-Version': '2022-11-28',
-      },
-    });
-  });
-
   it('fetches public files without authorization', async () => {
     const fetchMock = vi.fn(
       async (
@@ -174,58 +131,7 @@ describe('repository fetching', () => {
     expect(init?.headers).toBeUndefined();
   });
 
-  it('falls back from unavailable raw content to authenticated API', async () => {
-    let requestCount = 0;
-    const fetchMock = vi.fn(
-      async (
-        _input: RequestInfo | URL,
-        _init?: RequestInit,
-      ): Promise<Response> => {
-        requestCount += 1;
-        return requestCount === 1
-          ? new Response('missing', { status: 404 })
-          : new Response('private bytes', { status: 200 });
-      },
-    );
-    globalThis.fetch = fetchMock as typeof fetch;
-
-    const resource = await fetchRepositoryBytes(
-      repoRef,
-      repoRef.path,
-      new AbortController().signal,
-      { token: 'secret-token' },
-    );
-
-    expect(resource.authenticated).toBe(true);
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      1,
-      buildRawUrl(repoRef),
-      expect.objectContaining({ credentials: 'omit', redirect: 'error' }),
-    );
-    expect(fetchMock.mock.calls[1][0]).toBe(buildContentsApiUrl(repoRef));
-    expect(fetchMock.mock.calls[1][1]).toMatchObject({
-      headers: { Authorization: 'Bearer secret-token' },
-    });
-  });
-
-  it('never sends a configured token to public raw content', async () => {
-    const fetchMock = vi.fn(
-      async (): Promise<Response> => new Response('public bytes', { status: 200 }),
-    );
-    globalThis.fetch = fetchMock as typeof fetch;
-
-    await fetchRepositoryFile(repoRef, new AbortController().signal, {
-      token: 'secret-token',
-    });
-
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0]).toEqual([
-      buildRawUrl(repoRef),
-      expect.not.objectContaining({ headers: expect.anything() }),
-    ]);
-  });
-
-  it('rejects private access without a token or GitHub browser session', async () => {
+  it('rejects private access without a GitHub browser session', async () => {
     const fetchMock = vi.fn();
     globalThis.fetch = fetchMock as typeof fetch;
 
@@ -237,21 +143,19 @@ describe('repository fetching', () => {
         { privateRepo: true },
       ),
     ).rejects.toThrow(
-      'Private repository access requires an active GitHub browser session or a saved GitHub token.',
+      'Private repository access requires a signed-in GitHub browser session.',
     );
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('does not retry a public server error through the authenticated API', async () => {
+  it('does not retry a public server error through the GitHub session', async () => {
     const fetchMock = vi.fn(
       async (): Promise<Response> => new Response('outage', { status: 500 }),
     );
     globalThis.fetch = fetchMock as typeof fetch;
 
     await expect(
-      fetchRepositoryBytes(repoRef, repoRef.path, new AbortController().signal, {
-        token: 'secret-token',
-      }),
+      fetchRepositoryBytes(repoRef, repoRef.path, new AbortController().signal),
     ).rejects.toThrow('Public raw file returned HTTP 500.');
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledWith(
@@ -278,7 +182,7 @@ describe('repository fetching', () => {
     const resource = await fetchRepositoryFile(
       repoRef,
       new AbortController().signal,
-      { privateRepo: true, token: null },
+      { privateRepo: true },
     );
     expect(resource.text).toBe('<h1>Session file</h1>');
     expect(resource.authenticated).toBe(true);
@@ -307,10 +211,9 @@ describe('repository fetching', () => {
     await expect(
       fetchRepositoryFile(repoRef, new AbortController().signal, {
         privateRepo: true,
-        token: null,
       }),
     ).rejects.toThrow(
-      'Private repository access requires an active GitHub browser session or a saved GitHub token.',
+      'Private repository access requires a signed-in GitHub browser session.',
     );
   });
 
@@ -327,9 +230,11 @@ describe('repository fetching', () => {
     );
     globalThis.fetch = fetchMock as typeof fetch;
 
-    const pending = fetchRepositoryBytes(repoRef, repoRef.path, controller.signal, {
-      token: 'secret-token',
-    });
+    const pending = fetchRepositoryBytes(
+      repoRef,
+      repoRef.path,
+      controller.signal,
+    );
     controller.abort();
 
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' });

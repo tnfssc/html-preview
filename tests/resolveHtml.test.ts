@@ -20,6 +20,7 @@ const originalFetch = globalThis.fetch;
 afterEach(() => {
   globalThis.fetch = originalFetch;
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe('resolveRepositoryUrl', () => {
@@ -71,17 +72,22 @@ describe('resolver errors', () => {
   });
 
   it('omits oversized resources with actionable diagnostics', async () => {
-    globalThis.fetch = vi.fn(async () =>
-      new Response('oversized', {
+    vi.stubGlobal(
+      'location',
+      new URL('https://github.com/acme/reports/blob/main/index.html'),
+    );
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const response = new Response('oversized', {
         status: 200,
         headers: { 'content-type': 'image/png' },
-      }),
-    ) as typeof fetch;
+      });
+      Object.defineProperty(response, 'url', { value: String(input) });
+      return response;
+    }) as typeof fetch;
 
     const result = await resolveHtml('<img id="large" src="large.png">', {
       target: 'sandbox-private',
       repoRef,
-      githubToken: 'secret-token',
       limits: { maxResourceBytes: 4 },
     });
     const doc = new DOMParser().parseFromString(result.html, 'text/html');
@@ -237,50 +243,52 @@ describe('sandbox preview', () => {
     });
   });
 
-  it('packages private CSS, images, classic scripts, and module graphs without exposing token', async () => {
-    const apiPrefix =
-      'https://api.github.com/repos/acme/reports/contents/';
+  it('packages private CSS, images, classic scripts, and module graphs through the GitHub session', async () => {
+    vi.stubGlobal(
+      'location',
+      new URL('https://github.com/acme/reports/blob/main/index.html'),
+    );
+    const sessionPrefix =
+      `https://github.com/acme/reports/raw/${repoRef.ref}/`;
     const resources: Record<string, { body: string; type: string }> = {
-      [`${apiPrefix}assets/private.css?ref=${repoRef.ref}`]: {
+      [`${sessionPrefix}assets/private.css`]: {
         body: '.hero { background: url(\"./background.png\") }',
         type: 'text/plain',
       },
-      [`${apiPrefix}assets/background.png?ref=${repoRef.ref}`]: {
+      [`${sessionPrefix}assets/background.png`]: {
         body: 'background',
         type: 'application/octet-stream',
       },
-      [`${apiPrefix}reports/weekly/chart.png?ref=${repoRef.ref}`]: {
+      [`${sessionPrefix}reports/weekly/chart.png`]: {
         body: 'chart',
         type: 'application/octet-stream',
       },
-      [`${apiPrefix}reports/weekly/classic.js?ref=${repoRef.ref}`]: {
+      [`${sessionPrefix}reports/weekly/classic.js`]: {
         body: 'globalThis.classicLoaded = true;',
         type: 'application/octet-stream',
       },
-      [`${apiPrefix}reports/weekly/main.js?ref=${repoRef.ref}`]: {
+      [`${sessionPrefix}reports/weekly/main.js`]: {
         body: 'import { value } from \"./dependency.js\"; globalThis.moduleValue = value;',
         type: 'application/octet-stream',
       },
-      [`${apiPrefix}reports/weekly/dependency.js?ref=${repoRef.ref}`]: {
+      [`${sessionPrefix}reports/weekly/dependency.js`]: {
         body: 'export const value = 42;',
         type: 'application/octet-stream',
       },
     };
-    const requests: Array<{ url: string; authorization: string | null }> = [];
-    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const requests: string[] = [];
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      const headers = new Headers(init?.headers);
-      requests.push({
-        url,
-        authorization: headers.get('Authorization'),
-      });
+      requests.push(url);
       const resource = resources[url];
-      return resource
+      const response = resource
         ? new Response(resource.body, {
             status: 200,
             headers: { 'content-type': resource.type },
           })
         : new Response('missing', { status: 404 });
+      Object.defineProperty(response, 'url', { value: url });
+      return response;
     }) as typeof fetch;
 
     const result = await resolveHtml(
@@ -295,7 +303,6 @@ describe('sandbox preview', () => {
       {
         target: 'sandbox-private',
         repoRef,
-        githubToken: 'secret-token',
         privateRepo: true,
       },
     );
@@ -332,15 +339,9 @@ describe('sandbox preview', () => {
       doc.querySelector('script[type="importmap"]')?.textContent ?? '';
     expect(importMap).toContain('https://private-preview.invalid/reports/weekly/dependency.js');
     expect(importMap).toContain('data:application/javascript;base64,');
-    expect(result.html).not.toContain('secret-token');
     expect(result.html).not.toContain('api.github.com');
     expect(requests).toHaveLength(6);
-    expect(
-      requests.every(
-        ({ url, authorization }) =>
-          url.startsWith(apiPrefix) && authorization === 'Bearer secret-token',
-      ),
-    ).toBe(true);
+    expect(requests.every((url) => url.startsWith(sessionPrefix))).toBe(true);
     expect(result.resources.failed).toBe(0);
   });
 
@@ -354,7 +355,7 @@ describe('sandbox preview', () => {
     });
     expect(result.resources.failed).toBe(1);
     expect(result.diagnostics[0]?.message).toContain(
-      'active GitHub browser session or a saved GitHub token',
+      'signed-in GitHub browser session',
     );
     expect(fetchMock).not.toHaveBeenCalled();
   });

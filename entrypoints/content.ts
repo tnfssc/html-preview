@@ -5,11 +5,18 @@ import {
 } from '@/utils/github';
 import { resolveHtml } from '@/utils/resolveHtml';
 import { renderExecutablePreview, type RenderResult } from '@/utils/renderer';
-import { enabledStorage, githubTokenStorage } from '@/utils/storage';
+import {
+  enabledStorage,
+  purgeLegacyCredentials,
+} from '@/utils/storage';
 import type { BlobPageData } from '@/utils/github';
 import type { RepoRef, ResolveResult } from '@/utils/types';
 import { recordResolveMetrics } from '@/utils/metrics';
 import { debugError, debugLog } from '@/utils/debug';
+import {
+  removePreviewSnapshot,
+  savePreviewSnapshot,
+} from '@/utils/previewSnapshot';
 
 const PREVIEW_TAB_CLASS = 'gh-html-preview-tab';
 const PREVIEW_CONTAINER_CLASS = 'gh-html-preview-container';
@@ -32,10 +39,12 @@ interface RouteState {
   readonly previewArea: HTMLElement;
   readonly status: HTMLElement;
   readonly details: HTMLElement;
+  readonly fullLink: HTMLAnchorElement;
   codeView: HTMLElement;
   active: boolean;
   render: RenderResult | null;
   resolving: Promise<void> | null;
+  snapshotId: string | null;
 }
 
 export default defineContentScript({
@@ -66,6 +75,7 @@ export default defineContentScript({
       }
       state.controller.abort();
       state.render?.destroy();
+      void removePreviewSnapshot(state.snapshotId);
       state.nativeListenerCleanup.forEach((cleanup) => cleanup());
       if (state.codeView.isConnected) state.codeView.style.removeProperty('display');
       state.tab.remove();
@@ -125,12 +135,13 @@ export default defineContentScript({
       status.setAttribute('role', 'status');
       status.textContent = pageData.diagnostic ? 'Partial' : 'Ready';
       const fullLink = document.createElement('a');
-      fullLink.href = buildPreviewPageUrl(repoRef, pageData.isPrivate);
+      fullLink.href = '#';
       fullLink.target = '_blank';
       fullLink.rel = 'noreferrer';
       fullLink.textContent = 'Open full preview';
       fullLink.style.cssText =
-        'color:var(--fgColor-accent,#0969da);text-decoration:none;';
+        'color:var(--fgColor-muted,#59636e);text-decoration:none;pointer-events:none;';
+      fullLink.setAttribute('aria-disabled', 'true');
       const execution = document.createElement('span');
       execution.textContent = 'Executable · Scripts and network access on';
       header.append(status, execution, fullLink);
@@ -166,10 +177,12 @@ export default defineContentScript({
         previewArea,
         status,
         details,
+        fullLink,
         codeView,
         active: false,
         render: null,
         resolving: null,
+        snapshotId: null,
       };
       debugLog('blob', 'mounted', {
         owner: repoRef.owner,
@@ -283,22 +296,17 @@ export default defineContentScript({
       if (!enabled) teardown();
       else scheduleReconcile();
     });
-    const unwatchToken = githubTokenStorage.watch(() => {
-      const wasActive = state?.active ?? false;
-      teardown();
-      reconcile();
-      if (wasActive) showPreview();
-    });
-
-    void enabledStorage.getValue().then((value) => {
-      enabled = value;
-      reconcile();
-    });
+    void Promise.all([
+      enabledStorage.getValue(),
+      purgeLegacyCredentials(),
+    ]).then(([value]) => {
+        enabled = value;
+        reconcile();
+      });
 
     ctx.onInvalidated(() => {
       observer.disconnect();
       unwatchEnabled();
-      unwatchToken();
       teardown();
     });
   },
@@ -315,29 +323,20 @@ async function ensureResolved(route: RouteState): Promise<void> {
 
   route.resolving = (async () => {
     try {
-      const githubToken = await githubTokenStorage.getValue();
       debugLog('blob', 'resolve-start', {
         path: route.repoRef.path,
         privateRepo: route.isPrivate,
-        tokenConfigured: Boolean(githubToken),
       });
-      if (route.isPrivate && !githubToken) {
-        throw new Error(
-          'Private repository access requires a fine-grained GitHub token saved in the extension popup.',
-        );
-      }
       const sourceHtml =
         route.sourceHtml ??
         (
           await fetchRepositoryFile(route.repoRef, route.controller.signal, {
-            token: githubToken,
             privateRepo: route.isPrivate,
           })
         ).text;
       const result = await resolveHtml(sourceHtml, {
         target: route.isPrivate ? 'sandbox-private' : 'sandbox',
         repoRef: route.repoRef,
-        githubToken,
         privateRepo: route.isPrivate,
         signal: route.controller.signal,
       });
@@ -347,6 +346,23 @@ async function ensureResolved(route: RouteState): Promise<void> {
         result.performance.outputBytes,
       );
       route.render = renderExecutablePreview(route.previewArea, result);
+      try {
+        route.snapshotId = await savePreviewSnapshot(
+          result,
+          route.repoRef,
+          route.isPrivate,
+        );
+        route.fullLink.href = browser.runtime.getURL(
+          `/preview.html?snapshot=${encodeURIComponent(route.snapshotId)}`,
+        );
+        route.fullLink.style.cssText =
+          'color:var(--fgColor-accent,#0969da);text-decoration:none;';
+        route.fullLink.removeAttribute('aria-disabled');
+      } catch (error) {
+        debugError('blob', 'snapshot-save-failed', error, {
+          path: route.repoRef.path,
+        });
+      }
       updateResolvedStatus(route, result);
       debugLog('blob', 'resolve-complete', {
         path: route.repoRef.path,
@@ -552,20 +568,6 @@ function setSelectedTab(
     if (selected) item?.setAttribute('data-selected', '');
     else item?.removeAttribute('data-selected');
   }
-}
-
-function buildPreviewPageUrl(
-  repoRef: Readonly<RepoRef>,
-  isPrivate: boolean,
-): string {
-  const params = new URLSearchParams({
-    owner: repoRef.owner,
-    repo: repoRef.repo,
-    ref: repoRef.ref,
-    path: repoRef.path,
-    ...(isPrivate ? { private: '1' } : {}),
-  });
-  return browser.runtime.getURL(`/preview.html?${params.toString()}`);
 }
 
 function routeKey(repoRef: Readonly<RepoRef>): string {

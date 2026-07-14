@@ -1,13 +1,9 @@
 import { storage } from 'wxt/utils/storage';
+import { browser } from 'wxt/browser';
 
 export const enabledStorage = storage.defineItem<boolean>('local:enabled', {
   fallback: true,
 });
-
-export const githubTokenStorage = storage.defineItem<string | null>(
-  'local:githubToken',
-  { fallback: null },
-);
 
 export interface ComparisonPreferences {
   mode: 'source' | 'split' | 'after';
@@ -24,13 +20,7 @@ export const comparisonPreferencesStorage =
     },
   });
 
-export async function getSettings(): Promise<{
-  enabled: boolean;
-  githubToken: string | null;
-}> {
-  const [enabled, githubToken] = await Promise.all([
-    enabledStorage.getValue(),
-    githubTokenStorage.getValue(),
-  ]);
-  return { enabled, githubToken };
+export async function purgeLegacyCredentials(): Promise<void> {
+  await browser.storage.local.remove(['githubToken', 'local:githubToken']);
 }
+

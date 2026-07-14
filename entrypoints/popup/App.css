@@ -103,54 +103,6 @@ body {
   color: var(--gh-fg-muted);
 }
 
-.token-form input {
-  width: 100%;
-  margin-top: 10px;
-  padding: 7px 9px;
-  border: 1px solid var(--gh-border-default);
-  border-radius: 6px;
-  color: var(--gh-fg-default);
-  background: var(--gh-bg-default);
-}
-
-.token-link {
-  display: inline-block;
-  margin-top: 8px;
-  color: var(--gh-fg-accent);
-  font-size: 12px;
-  font-weight: 600;
-  text-decoration: none;
-}
-
-.token-link:hover {
-  text-decoration: underline;
-}
-
-.button-row {
-  display: flex;
-  gap: 8px;
-  margin-top: 10px;
-}
-
-.button-row button {
-  padding: 6px 10px;
-  border: 1px solid var(--gh-border-default);
-  border-radius: 6px;
-  color: var(--gh-fg-default);
-  background: var(--gh-bg-default);
-  cursor: pointer;
-}
-
-.button-row button:first-child {
-  color: #fff;
-  border-color: var(--gh-fg-accent);
-  background: var(--gh-fg-accent);
-}
-
-.button-row button:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
 
 button:focus-visible,
 input:focus-visible,

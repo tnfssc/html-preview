@@ -7,7 +7,7 @@ import {
 import {
   comparisonPreferencesStorage,
   enabledStorage,
-  githubTokenStorage,
+  purgeLegacyCredentials,
   type ComparisonPreferences,
 } from '@/utils/storage';
 import { resolveHtml } from '@/utils/resolveHtml';
@@ -104,7 +104,6 @@ export default defineContentScript({
       path: location.pathname,
     });
     let enabled = true;
-    let githubToken: string | null = null;
     let preferences: ComparisonPreferences = {
       mode: 'source',
       viewport: 'responsive',
@@ -206,7 +205,6 @@ export default defineContentScript({
                 privateRepo: false,
               }
             : null,
-          githubToken,
           routeState,
           preferences,
         );
@@ -218,7 +216,6 @@ export default defineContentScript({
         routeState.fallbackPromise = ensureFallbackDiffCards(
           routeState,
           targets.map((target) => target.path),
-          githubToken,
         )
           .catch((error: unknown) => {
             debugError('pr', 'fallback-diffs-failed', error);
@@ -308,18 +305,12 @@ export default defineContentScript({
       enabled = next;
       reconcileRoute();
     });
-    const unwatchToken = githubTokenStorage.watch((next) => {
-      githubToken = next;
-      stopRoute();
-      reconcileRoute();
-    });
     void Promise.all([
       enabledStorage.getValue(),
-      githubTokenStorage.getValue(),
       comparisonPreferencesStorage.getValue(),
-    ]).then(([storedEnabled, storedToken, storedPreferences]) => {
+      purgeLegacyCredentials(),
+    ]).then(([storedEnabled, storedPreferences]) => {
       enabled = storedEnabled;
-      githubToken = storedToken;
       preferences = storedPreferences;
       reconcileRoute();
     });
@@ -327,7 +318,6 @@ export default defineContentScript({
     ctx.onInvalidated(() => {
       observer.disconnect();
       unwatchEnabled();
-      unwatchToken();
       stopRoute();
     });
   },
@@ -336,10 +326,9 @@ export default defineContentScript({
 async function fetchDiffComparison(
   route: HtmlDiffRoute,
   signal: AbortSignal,
-  githubToken: string | null,
 ): Promise<DiffComparison> {
   if (route.kind !== 'pull') {
-    return fetchRevisionComparison(route, signal, githubToken);
+    return fetchRevisionComparison(route, signal);
   }
   const embedded = parseEmbeddedPullComparison(route);
   if (embedded) return embedded;
@@ -348,12 +337,10 @@ async function fetchDiffComparison(
     Accept: 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
   };
-  if (githubToken) headers.Authorization = `Bearer ${githubToken}`;
   debugLog('pr', 'metadata-fetch', {
     owner: route.owner,
     repo: route.repo,
     pull: route.pullNumber,
-    tokenConfigured: Boolean(githubToken),
   });
   const response = await fetch(url, {
     signal,
@@ -367,7 +354,7 @@ async function fetchDiffComparison(
     if (embedded) return embedded;
     throw new Error(
       response.status === 404
-        ? 'GitHub API returned HTTP 404. Authorize the saved token for organization SSO, approve repository access, or sign into the organization SSO in this GitHub tab.'
+        ? 'GitHub API returned HTTP 404. Sign into GitHub and organization SSO in this tab, then try again.'
         : `GitHub API returned HTTP ${response.status}`,
     );
   }
@@ -385,7 +372,6 @@ async function fetchDiffComparison(
 async function fetchRevisionComparison(
   route: Exclude<HtmlDiffRoute, { kind: 'pull' }>,
   signal: AbortSignal,
-  githubToken: string | null,
 ): Promise<DiffComparison> {
   const endpoint =
     route.kind === 'commit'
@@ -398,13 +384,11 @@ async function fetchRevisionComparison(
       fetchGitHubApiRecord(
         `https://api.github.com/repos/${encodeURIComponent(route.owner)}/${encodeURIComponent(route.repo)}`,
         signal,
-        githubToken,
         'repository metadata',
       ),
       fetchGitHubApiRecord(
         `https://api.github.com/repos/${encodeURIComponent(route.owner)}/${encodeURIComponent(route.repo)}/${endpoint}`,
         signal,
-        githubToken,
         `${route.kind} metadata`,
       ),
     ]);
@@ -531,14 +515,12 @@ async function fetchSessionCommitMetadata(
 async function fetchGitHubApiRecord(
   url: string,
   signal: AbortSignal,
-  githubToken: string | null,
   label: string,
 ): Promise<Record<string, unknown>> {
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
   };
-  if (githubToken) headers.Authorization = `Bearer ${githubToken}`;
   const response = await fetch(url, {
     signal,
     credentials: 'omit',
@@ -549,7 +531,7 @@ async function fetchGitHubApiRecord(
   if (!response.ok) {
     throw new Error(
       response.status === 404
-        ? `GitHub ${label} API returned HTTP 404. Authorize the saved token for organization SSO, approve repository access, or sign into the organization SSO in this GitHub tab.`
+        ? `GitHub ${label} API returned HTTP 404. Sign into GitHub and organization SSO in this tab, then try again.`
         : `GitHub ${label} API returned HTTP ${response.status}.`,
     );
   }
@@ -912,7 +894,6 @@ function validHtmlPath(path: string | null | undefined): path is string {
 function insertPreviewControls(
   target: DiffTarget,
   initialHead: DiffSide | null,
-  githubToken: string | null,
   routeState: DiffRouteState,
   preferences: ComparisonPreferences,
 ): void {
@@ -1119,7 +1100,7 @@ function insertPreviewControls(
   routeState.richDiffs.add(richState);
 
   if (!initialHead) {
-    void getDiffComparison(routeState, githubToken)
+    void getDiffComparison(routeState)
       .then((comparison) => {
         if (!richState.container.isConnected) return;
         richState.comparison = comparison;
@@ -1142,12 +1123,12 @@ function insertPreviewControls(
       syncScroll: richState.syncInput.checked,
     });
     showRenderedDiff(richState);
-    startRender(richState, githubToken, routeState, false);
+    startRender(richState, routeState, false);
   });
   reloadButton.addEventListener('click', () => {
     if (richState.mode !== 'source') {
       showRenderedDiff(richState);
-      startRender(richState, githubToken, routeState, true);
+      startRender(richState, routeState, true);
     }
   });
   viewportSelect.addEventListener('change', () => {
@@ -1268,7 +1249,6 @@ function hideCodeDiff(state: RichDiffState): void {
 
 function startRender(
   state: RichDiffState,
-  githubToken: string | null,
   routeState: DiffRouteState,
   force: boolean,
 ): void {
@@ -1278,7 +1258,6 @@ function startRender(
   state.reloadButton.textContent = 'Reloading…';
   state.resolving = renderRichComparison(
     state,
-    githubToken,
     routeState,
     force,
   ).finally(() => {
@@ -1291,7 +1270,6 @@ function startRender(
 
 async function renderRichComparison(
   state: RichDiffState,
-  githubToken: string | null,
   routeState: DiffRouteState,
   force: boolean,
 ): Promise<void> {
@@ -1314,13 +1292,12 @@ async function renderRichComparison(
   debugLog('pr', 'rich-comparison-start', {
     path: state.target.path,
     mode: state.mode,
-    tokenConfigured: Boolean(githubToken),
   });
   try {
     let comparison = state.comparison;
     if (!comparison) {
       try {
-        comparison = await getDiffComparison(routeState, githubToken);
+        comparison = await getDiffComparison(routeState);
       } catch (error) {
         if (!state.initialHead) throw error;
         state.baseArea.replaceChildren(
@@ -1343,7 +1320,6 @@ async function renderRichComparison(
             'base',
             comparison.base,
             routeState,
-            githubToken,
             controller.signal,
           ),
         );
@@ -1356,7 +1332,6 @@ async function renderRichComparison(
           'head',
           head,
           routeState,
-          githubToken,
           controller.signal,
         ),
       );
@@ -1403,7 +1378,6 @@ async function renderComparisonSide(
   sideName: 'base' | 'head',
   side: DiffSide,
   routeState: DiffRouteState,
-  githubToken: string | null,
   signal: AbortSignal,
 ): Promise<boolean> {
   const area = sideName === 'base' ? state.baseArea : state.headArea;
@@ -1413,14 +1387,12 @@ async function renderComparisonSide(
     let file;
     try {
       file = await fetchRepositoryFile(repoRef, signal, {
-        token: githubToken,
         privateRepo: side.privateRepo,
       });
     } catch (initialError) {
       const info = await getDiffFileInfo(
         routeState,
         state.target.path,
-        githubToken,
       );
       if (
         sideName === 'base' &&
@@ -1430,7 +1402,6 @@ async function renderComparisonSide(
         path = info.previousFilename;
         repoRef = sideRepoRef(side, path);
         file = await fetchRepositoryFile(repoRef, signal, {
-          token: githubToken,
           privateRepo: side.privateRepo,
         });
       } else if (sideName === 'base' && info?.status === 'added') {
@@ -1445,7 +1416,6 @@ async function renderComparisonSide(
     const result = await resolveHtml(file.text, {
       target: privateRepo ? 'sandbox-private' : 'sandbox',
       repoRef,
-      githubToken,
       privateRepo,
       signal,
     });
@@ -1490,12 +1460,10 @@ async function renderComparisonSide(
 
 async function getDiffComparison(
   routeState: DiffRouteState,
-  githubToken: string | null,
 ): Promise<DiffComparison> {
   routeState.metadata ??= fetchDiffComparison(
     routeState.route,
     routeState.controller.signal,
-    githubToken,
   ).catch((error: unknown) => {
     routeState.metadata = null;
     throw error;
@@ -1506,12 +1474,10 @@ async function getDiffComparison(
 async function getDiffFileInfo(
   routeState: DiffRouteState,
   path: string,
-  githubToken: string | null,
 ): Promise<DiffFileInfo | null> {
   routeState.fileMetadata ??= fetchDiffFiles(
     routeState.route,
     routeState.controller.signal,
-    githubToken,
   );
   const files = await routeState.fileMetadata;
   return (
@@ -1524,12 +1490,10 @@ async function getDiffFileInfo(
 
 async function getDiffFiles(
   routeState: DiffRouteState,
-  githubToken: string | null,
 ): Promise<DiffFileInfo[]> {
   routeState.fileMetadata ??= fetchDiffFiles(
     routeState.route,
     routeState.controller.signal,
-    githubToken,
   );
   return routeState.fileMetadata;
 }
@@ -1537,9 +1501,8 @@ async function getDiffFiles(
 async function ensureFallbackDiffCards(
   routeState: DiffRouteState,
   renderedPaths: string[],
-  githubToken: string | null,
 ): Promise<number> {
-  const files = await getDiffFiles(routeState, githubToken);
+  const files = await getDiffFiles(routeState);
   if (routeState.controller.signal.aborted) return 0;
   const missing = files.filter(
     (file) =>
@@ -1595,7 +1558,6 @@ async function ensureFallbackDiffCards(
 async function fetchDiffFiles(
   route: HtmlDiffRoute,
   signal: AbortSignal,
-  githubToken: string | null,
 ): Promise<DiffFileInfo[]> {
   const suffix =
     route.kind === 'pull'
@@ -1608,7 +1570,6 @@ async function fetchDiffFiles(
     Accept: 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
   };
-  if (githubToken) headers.Authorization = `Bearer ${githubToken}`;
   const response = await fetch(url, {
     signal,
     credentials: 'omit',
@@ -1626,7 +1587,7 @@ async function fetchDiffFiles(
     if (embedded.length > 0) return embedded;
     throw new Error(
       response.status === 404
-        ? 'GitHub diff files API returned HTTP 404. Authorize the saved token for organization SSO, approve repository access, or sign into the organization SSO in this GitHub tab.'
+        ? 'GitHub diff files API returned HTTP 404. Sign into GitHub and organization SSO in this tab, then try again.'
         : `GitHub diff files API returned HTTP ${response.status}.`,
     );
   }

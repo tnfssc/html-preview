@@ -37,7 +37,9 @@ describe('packaged Chrome extension', () => {
   it('ships only required privileges and no background CSP modifier', async () => {
     const manifest = await readManifest();
     expect(manifest.permissions).toEqual(['storage']);
-    expect(manifest.background).toBeUndefined();
+    expect(manifest.background).toEqual({
+      service_worker: 'background.js',
+    });
     expect(manifest.host_permissions).toEqual([
       '*://github.com/*',
       '*://raw.githubusercontent.com/*',

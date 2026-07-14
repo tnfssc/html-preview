@@ -81,7 +81,6 @@ class ResourceLoader {
     readonly repoRef: RepoRef,
     readonly limits: ResolveLimits,
     readonly signal: AbortSignal,
-    readonly githubToken: string | null,
     readonly privateRepo: boolean,
   ) {}
 
@@ -106,7 +105,6 @@ class ResourceLoader {
         path,
         this.signal,
         {
-          token: this.githubToken,
           privateRepo: this.privateRepo,
           maxBytes: this.limits.maxResourceBytes,
         },
@@ -158,14 +156,12 @@ export async function resolveHtml(
     options.repoRef,
     limits,
     signal,
-    options.githubToken ?? null,
     options.privateRepo ?? options.target === 'sandbox-private',
   );
   debugLog('resolver', 'start', {
     target: options.target,
     path: options.repoRef.path,
     privateRepo: loader.privateRepo,
-    tokenConfigured: Boolean(loader.githubToken),
     htmlBytes: new TextEncoder().encode(html).byteLength,
   });
   const doc = new DOMParser().parseFromString(html, 'text/html');

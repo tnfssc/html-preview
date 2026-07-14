@@ -1,46 +1,26 @@
 import { useEffect, useRef, useState } from 'react';
-import { fetchRepositoryFile } from '@/utils/github';
-import { resolveHtml } from '@/utils/resolveHtml';
-import { githubTokenStorage } from '@/utils/storage';
 import {
   isSandboxReadyMessage,
   postSandboxDocument,
 } from '@/utils/sandboxProtocol';
 import type { RepoRef, ResolveResult } from '@/utils/types';
 import { debugError, debugLog } from '@/utils/debug';
-import { recordResolveMetrics } from '@/utils/metrics';
+import {
+  loadPreviewSnapshot,
+  type PreviewSnapshot,
+} from '@/utils/previewSnapshot';
 
 interface LoadState {
   kind: 'loading' | 'ready' | 'partial' | 'error';
   result?: ResolveResult;
+  snapshot?: PreviewSnapshot;
   message: string;
 }
 
-interface PreviewRequest {
-  repoRef: RepoRef;
-  privateRepo: boolean;
-}
-
-function parseRepoRef(): PreviewRequest | null {
+function parseSnapshotId(): string | null {
   const params = new URLSearchParams(window.location.search);
-  const owner = params.get('owner');
-  const repo = params.get('repo');
-  const ref = params.get('ref');
-  const path = params.get('path');
-  if (!owner || !repo || !ref || !path) return null;
-  if (
-    owner.includes('/') ||
-    repo.includes('/') ||
-    /[\u0000-\u001f]/.test(`${owner}${repo}${ref}${path}`) ||
-    path.startsWith('/') ||
-    path.split('/').some((segment) => !segment || segment === '..')
-  ) {
-    return null;
-  }
-  return {
-    repoRef: { owner, repo, ref, path },
-    privateRepo: params.get('private') === '1',
-  };
+  const snapshot = params.get('snapshot');
+  return snapshot && /^[0-9a-f-]{36}$/i.test(snapshot) ? snapshot : null;
 }
 
 function buildGitHubUrl(repoRef: RepoRef): string {
@@ -49,66 +29,39 @@ function buildGitHubUrl(repoRef: RepoRef): string {
 }
 
 export default function App(): React.JSX.Element {
-  const [request] = useState(parseRepoRef);
-  const [retryKey, setRetryKey] = useState(0);
+  const [snapshotId] = useState(parseSnapshotId);
   const [state, setState] = useState<LoadState>({
     kind: 'loading',
-    message: 'Fetching repository file…',
+    message: 'Loading packaged preview…',
   });
 
   useEffect(() => {
-    if (!request) {
+    if (!snapshotId) {
       setState({
         kind: 'error',
-        message: 'Missing or invalid owner, repository, ref, or path.',
+        message: 'Missing or invalid preview snapshot.',
       });
       return;
     }
-    const controller = new AbortController();
-    const { repoRef } = request;
-
     void (async () => {
       try {
-        const githubToken = await githubTokenStorage.getValue();
-        debugLog('preview', 'load-start', {
-          owner: repoRef.owner,
-          repo: repoRef.repo,
-          ref: repoRef.ref.slice(0, 12),
-          path: repoRef.path,
-          privateRepo: request.privateRepo,
-          tokenConfigured: Boolean(githubToken),
-        });
-        if (request.privateRepo && !githubToken) {
+        const snapshot = await loadPreviewSnapshot(snapshotId);
+        if (!snapshot) {
           throw new Error(
-            'Save a fine-grained GitHub token in the extension popup to open this private file.',
+            'Preview snapshot expired. Return to GitHub and open full preview again.',
           );
         }
-        const file = await fetchRepositoryFile(repoRef, controller.signal, {
-          token: githubToken,
-          privateRepo: request.privateRepo,
-        });
-        const privateRepo = request.privateRepo || file.authenticated;
-        setState({ kind: 'loading', message: 'Resolving repository URLs…' });
-        const result = await resolveHtml(file.text, {
-          target: privateRepo ? 'sandbox-private' : 'sandbox',
-          repoRef,
-          githubToken,
-          privateRepo,
-          signal: controller.signal,
-        });
+        const { result, repoRef, privateRepo } = snapshot;
         const partial = result.diagnostics.some(
           (diagnostic) => diagnostic.level === 'error',
-        );
-        recordResolveMetrics(
-          result.performance.resolveMs,
-          result.performance.outputBytes,
         );
         setState({
           kind: partial ? 'partial' : 'ready',
           result,
+          snapshot,
           message: partial
             ? 'Preview loaded with resource diagnostics.'
-            : 'Executable preview ready.',
+            : '',
         });
         debugLog('preview', 'load-complete', {
           path: repoRef.path,
@@ -118,49 +71,51 @@ export default function App(): React.JSX.Element {
           failed: result.resources.failed,
         });
       } catch (error) {
-        if (controller.signal.aborted) return;
-        debugError('preview', 'load-failed', error, {
-          path: repoRef.path,
-          privateRepo: request.privateRepo,
-        });
+        debugError('preview', 'load-failed', error);
         setState({
           kind: 'error',
           message: error instanceof Error ? error.message : 'Preview failed.',
         });
       }
     })();
+  }, [snapshotId]);
 
-    return () => controller.abort();
-  }, [request, retryKey]);
-
-  if (!request) {
+  if (!snapshotId) {
     return <main className="error">Error: {state.message}</main>;
   }
-  const { repoRef } = request;
+  const repoRef = state.snapshot?.repoRef;
 
   return (
     <main>
       <header>
         <h1>
           Preview:{' '}
-          <a href={buildGitHubUrl(repoRef)} target="_blank" rel="noreferrer">
-            {repoRef.owner}/{repoRef.repo}/{repoRef.path}
-          </a>
+          {repoRef ? (
+            <a href={buildGitHubUrl(repoRef)} target="_blank" rel="noreferrer">
+              {repoRef.owner}/{repoRef.repo}/{repoRef.path}
+            </a>
+          ) : (
+            'Loading'
+          )}
         </h1>
-        <span className="meta">
-          Commit {repoRef.ref.slice(0, 12)} · Executable · Scripts and network
-          access on{request.privateRepo ? ' · Private' : ''}
-        </span>
-        <button type="button" onClick={() => setRetryKey((value) => value + 1)}>
+        {repoRef && (
+          <span className="meta">
+            Commit {repoRef.ref.slice(0, 12)} · Executable · Scripts and network
+            access on{state.snapshot?.privateRepo ? ' · Private' : ''}
+          </span>
+        )}
+        <button type="button" onClick={() => window.location.reload()}>
           Reload
         </button>
       </header>
-      <div
-        className={`preview-status preview-status-${state.kind}`}
-        role={state.kind === 'error' ? 'alert' : 'status'}
-      >
-        {state.message}
-      </div>
+      {state.message && (
+        <div
+          className={`preview-status preview-status-${state.kind}`}
+          role={state.kind === 'error' ? 'alert' : 'status'}
+        >
+          {state.message}
+        </div>
+      )}
       {state.result && (
         <details className="diagnostics">
           <summary>Resources and network</summary>
@@ -209,20 +164,9 @@ export default function App(): React.JSX.Element {
       ) : state.kind === 'error' ? (
         <div className="error">
           <p>Preview unavailable. {state.message}</p>
-          <button type="button" onClick={() => setRetryKey((value) => value + 1)}>
+          <button type="button" onClick={() => window.location.reload()}>
             Retry
           </button>
-          {request.privateRepo && (
-            <a
-              href={(browser.runtime.getURL as (path: string) => string)(
-                '/popup.html',
-              )}
-              target="_blank"
-              rel="noreferrer"
-            >
-              Open extension settings
-            </a>
-          )}
         </div>
       ) : (
         <div className="loading">{state.message}</div>

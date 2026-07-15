@@ -18,6 +18,7 @@ import {
 } from '@/utils/renderer';
 import type { RepoRef } from '@/utils/types';
 import { debugError, debugLog } from '@/utils/debug';
+import { fetchWithRetry } from '@/utils/fetchWithRetry';
 import { recordResolveMetrics } from '@/utils/metrics';
 
 const PREVIEW_CONTROLS_CLASS = 'gh-html-preview-pr-controls';
@@ -345,7 +346,7 @@ async function fetchDiffComparison(
     repo: route.repo,
     pull: route.pullNumber,
   });
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     signal,
     credentials: 'omit',
     redirect: 'error',
@@ -469,7 +470,7 @@ async function fetchSessionCommitMetadata(
   signal: AbortSignal,
 ): Promise<{ oid: string; parents: string[] } | null> {
   try {
-    const response = await fetch(
+    const response = await fetchWithRetry(
       `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commit/${encodeURIComponent(ref)}`,
       {
         signal,
@@ -524,7 +525,7 @@ async function fetchGitHubApiRecord(
     Accept: 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
   };
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     signal,
     credentials: 'omit',
     redirect: 'error',
@@ -1601,7 +1602,7 @@ async function fetchDiffFiles(
     Accept: 'application/vnd.github+json',
     'X-GitHub-Api-Version': '2022-11-28',
   };
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     signal,
     credentials: 'omit',
     redirect: 'error',

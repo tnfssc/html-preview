@@ -41,7 +41,7 @@ Security boundaries:
 - Added and removed HTML must use one full-width pane. Never render an empty opposite pane.
 - Edited HTML must render both revisions without visible **Before**, **After**, or **Ready** labels.
 - Successful previews must not show resource panels or persistent diagnostics. Resource failures must remain actionable.
-- Failed entry files, assets, scripts, and comparison sides expose a failure-only **Retry** action that clears cached metadata and refetches without reloading GitHub.
+- Network failures and HTTP `408`, `425`, `429`, and `5xx` responses retry automatically three times with bounded exponential backoff. After exhaustion—or immediately for permanent failures—a failure-only **Retry** action clears cached metadata and refetches without reloading GitHub.
 - Review comments and GitHub collapse/expand behavior must continue working in Preview.
 - GitHub native and extension fallback cards must never produce duplicate previews.
 - Long HTML must remain scrollable. Edited panes must synchronize semantically when stable anchors exist and proportionally otherwise.

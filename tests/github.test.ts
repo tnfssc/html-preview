@@ -148,20 +148,25 @@ describe('repository fetching', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('does not retry a public server error through the GitHub session', async () => {
+  it('retries a public server error without switching to the GitHub session', async () => {
     const fetchMock = vi.fn(
-      async (): Promise<Response> => new Response('outage', { status: 500 }),
+      async (): Promise<Response> =>
+        new Response('outage', {
+          status: 500,
+          headers: { 'retry-after': '0' },
+        }),
     );
     globalThis.fetch = fetchMock as typeof fetch;
 
     await expect(
       fetchRepositoryBytes(repoRef, repoRef.path, new AbortController().signal),
     ).rejects.toThrow('Public raw file returned HTTP 500.');
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock).toHaveBeenCalledWith(
-      buildRawUrl(repoRef),
-      expect.not.objectContaining({ headers: expect.anything() }),
-    );
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(
+      fetchMock.mock.calls.every(
+        ([url]) => url === buildRawUrl(repoRef),
+      ),
+    ).toBe(true);
   });
 
   it('uses the signed-in GitHub session for private repository content', async () => {

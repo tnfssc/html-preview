@@ -200,7 +200,7 @@ test('blob preview embeds local CSS and executable script sources in a sandbox',
   }
 });
 
-test('blob resource issues can be retried without reloading GitHub', async () => {
+test('blob resources recover after three automatic retries', async () => {
   const { context, page } = await launchWithExtension();
   const url = 'https://github.com/acme/reports/blob/main/retry.html';
   const raw =
@@ -221,7 +221,7 @@ test('blob resource issues can be retried without reloading GitHub', async () =>
     await context.route(raw, async (route) => {
       attempts += 1;
       await route.fulfill(
-        attempts === 1
+        attempts <= 3
           ? { status: 503, body: 'Unavailable' }
           : {
               status: 200,
@@ -233,18 +233,6 @@ test('blob resource issues can be retried without reloading GitHub', async () =>
     await page.goto(url);
     await page.getByRole('tab', { name: 'Preview' }).click();
     const container = page.locator('.gh-html-preview-container');
-    await expect(container.getByRole('status')).toHaveText(
-      '1 resource issues',
-    );
-    await page.evaluate(() => {
-      Array.from(
-        document.querySelectorAll<HTMLButtonElement>(
-          '.gh-html-preview-container button',
-        ),
-      )
-        .find((button) => button.textContent?.trim() === 'Retry')
-        ?.click();
-    });
     await expect(container.getByRole('status')).toBeHidden();
     await expect(
       container
@@ -252,7 +240,10 @@ test('blob resource issues can be retried without reloading GitHub', async () =>
         .contentFrame()
         .locator('#retry-image'),
     ).toHaveAttribute('src', /^data:image\/png;base64,/);
-    expect(attempts).toBe(2);
+    expect(attempts).toBe(4);
+    await expect(container.getByRole('button', { name: 'Retry' })).toHaveCount(
+      0,
+    );
   } finally {
     await context.close();
   }
@@ -386,6 +377,7 @@ test('fork PR previews the exact head repository and commit', async () => {
         await route.fulfill({
           status: 503,
           body: 'API unavailable',
+          headers: { 'retry-after': '0' },
         });
         return;
       }
@@ -445,7 +437,7 @@ test('fork PR previews the exact head repository and commit', async () => {
           name: 'Display before and after previews',
         }),
     ).toHaveCount(1);
-    expect(apiRequests).toBe(1);
+    expect(apiRequests).toBe(4);
   } finally {
     await context.close();
   }
@@ -1028,7 +1020,7 @@ test('organization SSO falls back to embedded PR metadata and GitHub session raw
         sessionRequests.push(sessionRaw[1]);
         if (sessionRaw[1] === head) {
           headAttempts += 1;
-          if (headAttempts === 1) {
+          if (headAttempts <= 4) {
             await route.fulfill({ status: 503, body: 'Unavailable' });
             return;
           }
@@ -1084,7 +1076,7 @@ test('organization SSO falls back to embedded PR metadata and GitHub session raw
     await expect(
       comparison.locator(`iframe[title="After HTML preview for ${filePath}"]`),
     ).toHaveCount(1);
-    expect(headAttempts).toBe(2);
+    expect(headAttempts).toBe(5);
     await expect(comparison.getByRole('button', { name: 'Retry' })).toBeHidden();
   } finally {
     await context.close();
@@ -1307,7 +1299,7 @@ test('missing embedded source produces recoverable inline error', async () => {
     await context.route(`${rawBase}/reports/weekly/index.html`, async (route) => {
       attempts += 1;
       await route.fulfill(
-        attempts === 1
+        attempts <= 4
           ? { status: 503, body: 'unavailable' }
           : {
               status: 200,
@@ -1338,6 +1330,7 @@ test('missing embedded source produces recoverable inline error', async () => {
         .contentFrame()
         .locator('#retry-success'),
     ).toHaveText('Retry succeeded');
+    expect(attempts).toBe(5);
     await page.getByRole('button', { name: 'Code' }).click();
     await expect(page.locator('.react-code-lines')).toBeVisible();
   } finally {

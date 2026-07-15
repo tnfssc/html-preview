@@ -1,5 +1,6 @@
 import type { RepoRef } from './types';
 import { debugError, debugLog } from './debug';
+import { fetchWithRetry } from './fetchWithRetry';
 
 export interface BlobPageData {
   html: string | null;
@@ -268,12 +269,23 @@ export async function fetchRepositoryBytes(
       repo: repoRef.repo,
       path,
     });
-    const publicResponse = await fetch(buildRawUrl({ ...repoRef, path }), {
-      signal,
-      credentials: 'omit',
-      redirect: 'error',
-      referrerPolicy: 'no-referrer',
-    });
+    const publicResponse = await fetchWithRetry(
+      buildRawUrl({ ...repoRef, path }),
+      {
+        signal,
+        credentials: 'omit',
+        redirect: 'error',
+        referrerPolicy: 'no-referrer',
+      },
+      {
+        onRetry: (attempt, reason) =>
+          debugLog('github', 'fetch-public-retry', {
+            path,
+            attempt,
+            reason: typeof reason === 'number' ? reason : reason.message,
+          }),
+      },
+    );
     if (publicResponse.ok) {
       const resource = await readRepositoryResponse(
         publicResponse,
@@ -326,13 +338,21 @@ async function fetchViaGitHubSession(
   });
   let response: Response;
   try {
-    response = await fetch(
+    response = await fetchWithRetry(
       buildGitHubSessionRawUrl(repoRef, path),
       {
         signal,
         credentials: 'same-origin',
         redirect: 'follow',
         referrerPolicy: 'same-origin',
+      },
+      {
+        onRetry: (attempt, reason) =>
+          debugLog('github', 'fetch-session-retry', {
+            path,
+            attempt,
+            reason: typeof reason === 'number' ? reason : reason.message,
+          }),
       },
     );
   } catch (error) {

@@ -150,7 +150,10 @@ describe('repository fetching', () => {
 
   it('retries a public server error without switching to the GitHub session', async () => {
     const fetchMock = vi.fn(
-      async (): Promise<Response> =>
+      async (
+        _input: RequestInfo | URL,
+        _init?: RequestInit,
+      ): Promise<Response> =>
         new Response('outage', {
           status: 500,
           headers: { 'retry-after': '0' },

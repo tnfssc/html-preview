@@ -911,8 +911,8 @@ test('PR metadata failure leaves the source diff recoverable', async () => {
       })
       .click();
     const comparison = region.locator('.gh-html-preview-pr-rich');
-    await expect(comparison.getByRole('status')).toHaveText(
-      'Error: GitHub API returned HTTP 503',
+    await expect(comparison).toContainText(
+      'Comparison unavailable. GitHub API returned HTTP 503',
     );
     await expect(comparison.locator('iframe')).toHaveCount(0);
 
@@ -957,6 +957,105 @@ test('GitHub SPA navigation mounts diff controls without a location event', asyn
         name: 'Display before and after previews',
       }),
     ).toHaveCount(1);
+  } finally {
+    await context.close();
+  }
+});
+
+test('private PR first load recovers metadata from the signed-in GitHub page', async () => {
+  const { context, page } = await launchWithExtension();
+  const filePath = 'private/first-load.html';
+  const base = 'b'.repeat(40);
+  const head = 'a'.repeat(40);
+  const prUrl = 'https://github.com/acme/reports/pull/60/changes';
+  const embedded = JSON.stringify({
+    payload: {
+      pullRequestsChangesRoute: {
+        comparison: { fullDiff: { baseOid: base, headOid: head } },
+        pullRequest: {
+          comparison: { baseOid: base, headOid: head },
+          headRepositoryOwnerLogin: 'acme',
+          headRepositoryName: 'reports',
+        },
+        diffContents: [
+          {
+            path: filePath,
+            status: 'MODIFIED',
+            oldTreeEntry: { path: filePath },
+          },
+        ],
+      },
+    },
+  }).replaceAll('<', '\\u003c');
+  const firstPage = githubReactPrFixture(filePath);
+  const sessionPage = firstPage.replace(
+    '</body>',
+    `<script type="application/json" data-target="react-app.embeddedData">${embedded}</script></body>`,
+  );
+  let headAttempts = 0;
+  try {
+    await context.route('**/*', async (route) => {
+      const url = route.request().url();
+      if (url === prUrl) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body:
+            route.request().resourceType() === 'document'
+              ? firstPage
+              : sessionPage,
+        });
+        return;
+      }
+      if (
+        url === 'https://api.github.com/repos/acme/reports/pulls/60' ||
+        url ===
+          'https://api.github.com/repos/acme/reports/pulls/60/files?per_page=100'
+      ) {
+        await route.fulfill({ status: 404, json: { message: 'Not Found' } });
+        return;
+      }
+      if (
+        url ===
+          `https://github.com/acme/reports/raw/${base}/${filePath}` ||
+        url ===
+          `https://github.com/acme/reports/raw/${head}/${filePath}`
+      ) {
+        if (url.includes(head)) {
+          headAttempts += 1;
+          if (headAttempts === 1) {
+            await route.fulfill({ status: 404, body: 'Not Found' });
+            return;
+          }
+        }
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/plain',
+          body: `<h1>${url.includes(base) ? 'Before' : 'After'}</h1>`,
+        });
+        return;
+      }
+      await route.abort();
+    });
+
+    await page.goto(prUrl);
+    await page
+      .getByRole('tab', { name: 'Display before and after previews' })
+      .click();
+    const comparison = page.locator('.gh-html-preview-pr-rich');
+    await expect(
+      comparison.locator(`iframe[title="Before HTML preview for ${filePath}"]`),
+    ).toHaveCount(1);
+    const retry = comparison.getByRole('button', { name: 'Retry' });
+    await expect(retry).toBeVisible();
+    await expect(comparison.getByRole('status')).toBeHidden();
+    await expect(retry).toHaveCSS('position', 'absolute');
+    await retry.click();
+    await expect(
+      comparison.locator(`iframe[title="After HTML preview for ${filePath}"]`),
+    ).toHaveCount(1);
+    expect(headAttempts).toBe(2);
+    await expect(retry).toBeHidden();
   } finally {
     await context.close();
   }

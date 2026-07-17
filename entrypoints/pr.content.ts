@@ -51,6 +51,7 @@ interface DiffRouteState {
   readonly controller: AbortController;
   metadata: Promise<DiffComparison> | null;
   fileMetadata: Promise<DiffFileInfo[]> | null;
+  sessionPullData: Promise<Record<string, unknown> | null> | null;
   fallbackPromise: Promise<number> | null;
   readonly richDiffs: Set<RichDiffState>;
 }
@@ -276,6 +277,7 @@ export default defineContentScript({
           controller,
           metadata: null,
           fileMetadata: null,
+          sessionPullData: null,
           fallbackPromise: null,
           richDiffs: new Set(),
         };
@@ -328,9 +330,10 @@ export default defineContentScript({
 });
 
 async function fetchDiffComparison(
-  route: HtmlDiffRoute,
-  signal: AbortSignal,
+  routeState: DiffRouteState,
 ): Promise<DiffComparison> {
+  const { route } = routeState;
+  const { signal } = routeState.controller;
   if (route.kind !== 'pull') {
     return fetchRevisionComparison(route, signal);
   }
@@ -354,7 +357,10 @@ async function fetchDiffComparison(
     headers,
   });
   if (!response.ok) {
-    const embedded = parseEmbeddedPullComparison(route);
+    const embedded = parseEmbeddedPullComparison(
+      route,
+      await getSessionPullChangesRoute(routeState),
+    );
     if (embedded) return embedded;
     throw new Error(
       response.status === 404
@@ -593,8 +599,8 @@ function parsePullSide(value: unknown, label: 'base' | 'head'): DiffSide {
 
 function parseEmbeddedPullComparison(
   route: Extract<HtmlDiffRoute, { kind: 'pull' }>,
+  data: Record<string, unknown> | null = readEmbeddedPullChangesRoute(),
 ): DiffComparison | null {
-  const data = readEmbeddedPullChangesRoute();
   if (!data) return null;
   const pullRequest = asRecord(data.pullRequest);
   const routeComparison = asRecord(data.comparison);
@@ -631,8 +637,10 @@ function parseEmbeddedPullComparison(
   };
 }
 
-function readEmbeddedPullChangesRoute(): Record<string, unknown> | null {
-  for (const script of document.querySelectorAll(
+function readEmbeddedPullChangesRoute(
+  root: ParentNode = document,
+): Record<string, unknown> | null {
+  for (const script of root.querySelectorAll(
     'script[data-target="react-app.embeddedData"]',
   )) {
     if (!script.textContent?.includes('"pullRequestsChangesRoute"')) continue;
@@ -648,8 +656,54 @@ function readEmbeddedPullChangesRoute(): Record<string, unknown> | null {
   return null;
 }
 
-function parseEmbeddedPullFiles(): DiffFileInfo[] {
-  const data = readEmbeddedPullChangesRoute();
+async function getSessionPullChangesRoute(
+  routeState: DiffRouteState,
+): Promise<Record<string, unknown> | null> {
+  const embedded = readEmbeddedPullChangesRoute();
+  if (embedded || routeState.route.kind !== 'pull') return embedded;
+  routeState.sessionPullData ??= fetchSessionPullChangesRoute(
+    routeState.route,
+    routeState.controller.signal,
+  ).catch((error: unknown) => {
+    routeState.sessionPullData = null;
+    if (routeState.controller.signal.aborted) throw error;
+    debugError('pr', 'session-pull-metadata-failed', error);
+    return null;
+  });
+  return routeState.sessionPullData;
+}
+
+async function fetchSessionPullChangesRoute(
+  route: Extract<HtmlDiffRoute, { kind: 'pull' }>,
+  signal: AbortSignal,
+): Promise<Record<string, unknown> | null> {
+  if (location.origin !== 'https://github.com') return null;
+  const response = await fetchWithRetry(
+    `https://github.com/${encodeURIComponent(route.owner)}/${encodeURIComponent(route.repo)}/pull/${route.pullNumber}/changes`,
+    {
+      signal,
+      credentials: 'same-origin',
+      redirect: 'follow',
+      referrerPolicy: 'same-origin',
+    },
+  );
+  if (
+    !response.ok ||
+    new URL(response.url).origin !== 'https://github.com'
+  ) {
+    await response.body?.cancel();
+    return null;
+  }
+  const documentNode = new DOMParser().parseFromString(
+    await response.text(),
+    'text/html',
+  );
+  return readEmbeddedPullChangesRoute(documentNode);
+}
+
+function parseEmbeddedPullFiles(
+  data: Record<string, unknown> | null = readEmbeddedPullChangesRoute(),
+): DiffFileInfo[] {
   const contents = data?.diffContents;
   if (!Array.isArray(contents)) return [];
   return contents.flatMap((value): DiffFileInfo[] => {
@@ -955,14 +1009,12 @@ function insertPreviewControls(
     buttons[next].click();
   });
   container.style.cssText =
-    'display:none;flex-direction:column;height:calc(100dvh - 160px);min-height:500px;border-top:1px solid var(--borderColor-default,#d1d9e0);background:var(--bgColor-default,#fff);';
-  const header = document.createElement('div');
-  header.style.cssText =
-    'display:flex;align-items:center;justify-content:space-between;gap:12px;padding:6px 10px;border-bottom:1px solid var(--borderColor-default,#d1d9e0);background:var(--bgColor-muted,#f6f8fa);';
+    'display:none;position:relative;flex-direction:column;height:calc(100dvh - 160px);min-height:500px;border-top:1px solid var(--borderColor-default,#d1d9e0);background:var(--bgColor-default,#fff);';
   const status = document.createElement('div');
   status.setAttribute('role', 'status');
+  status.setAttribute('aria-live', 'polite');
   status.style.cssText =
-    'color:var(--fgColor-muted,#59636e);font-size:12px;font-weight:600;';
+    'display:none;';
   status.textContent = 'Choose Preview';
   const toolbar = document.createElement('div');
   toolbar.style.cssText = 'display:flex;align-items:center;gap:8px;flex-wrap:wrap;';
@@ -990,7 +1042,8 @@ function insertPreviewControls(
   syncInput.setAttribute('aria-label', 'Synchronize preview scrolling');
   syncLabel.append(syncInput, document.createTextNode('Sync scroll'));
   const reloadButton = createToolbarButton('Retry');
-  reloadButton.style.display = 'none';
+  reloadButton.style.cssText =
+    'display:none;position:absolute;top:8px;right:8px;z-index:3;box-shadow:var(--shadow-resting-small,0 1px 2px rgba(31,35,40,.15));';
   const fullscreenButton = createToolbarButton('Full screen');
   fullscreenButton.setAttribute('aria-pressed', 'false');
   const overlayLabel = document.createElement('label');
@@ -1012,7 +1065,6 @@ function insertPreviewControls(
   layoutStatus.setAttribute('aria-live', 'polite');
   const effectiveWidth = document.createElement('span');
   effectiveWidth.setAttribute('aria-live', 'polite');
-  header.append(status, reloadButton);
 
   const comparisonArea = document.createElement('div');
   comparisonArea.style.cssText =
@@ -1020,7 +1072,7 @@ function insertPreviewControls(
   const base = createComparisonPane();
   const head = createComparisonPane();
   comparisonArea.append(base.pane, head.pane);
-  container.append(header, comparisonArea);
+  container.append(status, reloadButton, comparisonArea);
   target.fileContent.before(container);
   target.actions.prepend(controls);
 
@@ -1288,15 +1340,13 @@ async function renderRichComparison(
     state.comparison = null;
     routeState.metadata = null;
     routeState.fileMetadata = null;
+    routeState.sessionPullData = null;
   }
   state.retryableFailures = 0;
   const controller = new AbortController();
   state.controller = controller;
   const abort = () => controller.abort();
   routeState.controller.signal.addEventListener('abort', abort, { once: true });
-  if (state.status.parentElement) {
-    state.status.parentElement.style.display = 'flex';
-  }
   state.status.textContent = 'Loading…';
   debugLog('pr', 'rich-comparison-start', {
     path: state.target.path,
@@ -1368,13 +1418,6 @@ async function renderRichComparison(
       state.retryableFailures > 0 || (!baseAvailable && !headAvailable)
         ? 'inline-flex'
         : 'none';
-    if (
-      (baseAvailable || headAvailable) &&
-      state.retryableFailures === 0 &&
-      state.status.parentElement
-    ) {
-      state.status.parentElement.style.display = 'none';
-    }
     debugLog('pr', 'rich-comparison-complete', {
       path: state.target.path,
       mode: state.mode,
@@ -1385,6 +1428,12 @@ async function renderRichComparison(
       error instanceof Error
         ? `Error: ${error.message}`
         : 'Error: Comparison failed.';
+    state.baseArea.replaceChildren(
+      createSideMessage('Comparison unavailable.', error),
+    );
+    state.basePane.style.display = 'flex';
+    state.headPane.style.display = 'none';
+    state.comparisonArea.style.gridTemplateColumns = 'minmax(0,1fr)';
     state.retryableFailures += 1;
     state.reloadButton.style.display = 'inline-flex';
     debugError('pr', 'rich-comparison-failed', error, {
@@ -1493,10 +1542,7 @@ async function renderComparisonSide(
 async function getDiffComparison(
   routeState: DiffRouteState,
 ): Promise<DiffComparison> {
-  routeState.metadata ??= fetchDiffComparison(
-    routeState.route,
-    routeState.controller.signal,
-  ).catch((error: unknown) => {
+  routeState.metadata ??= fetchDiffComparison(routeState).catch((error: unknown) => {
     routeState.metadata = null;
     throw error;
   });
@@ -1507,10 +1553,7 @@ async function getDiffFileInfo(
   routeState: DiffRouteState,
   path: string,
 ): Promise<DiffFileInfo | null> {
-  routeState.fileMetadata ??= fetchDiffFiles(
-    routeState.route,
-    routeState.controller.signal,
-  );
+  routeState.fileMetadata ??= fetchDiffFiles(routeState);
   const files = await routeState.fileMetadata;
   return (
     files.find(
@@ -1523,10 +1566,7 @@ async function getDiffFileInfo(
 async function getDiffFiles(
   routeState: DiffRouteState,
 ): Promise<DiffFileInfo[]> {
-  routeState.fileMetadata ??= fetchDiffFiles(
-    routeState.route,
-    routeState.controller.signal,
-  );
+  routeState.fileMetadata ??= fetchDiffFiles(routeState);
   return routeState.fileMetadata;
 }
 
@@ -1588,9 +1628,10 @@ async function ensureFallbackDiffCards(
 }
 
 async function fetchDiffFiles(
-  route: HtmlDiffRoute,
-  signal: AbortSignal,
+  routeState: DiffRouteState,
 ): Promise<DiffFileInfo[]> {
+  const { route } = routeState;
+  const { signal } = routeState.controller;
   const suffix =
     route.kind === 'pull'
       ? `pulls/${route.pullNumber}/files?per_page=100`
@@ -1612,7 +1653,7 @@ async function fetchDiffFiles(
   if (!response.ok) {
     const embedded =
       route.kind === 'pull'
-        ? parseEmbeddedPullFiles()
+        ? parseEmbeddedPullFiles(await getSessionPullChangesRoute(routeState))
         : route.kind === 'commit'
           ? parseEmbeddedCommitFiles()
           : [];

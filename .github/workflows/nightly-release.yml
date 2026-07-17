@@ -1,0 +1,100 @@
+name: Nightly Release
+
+on:
+  push:
+    branches:
+      - develop
+
+concurrency:
+  group: nightly-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Type-check
+        run: pnpm run compile
+
+      - name: Run unit and manifest contracts
+        run: pnpm test
+
+      - name: Run deterministic extension E2E
+        run: pnpm run test:e2e
+
+      - name: Define nightly release
+        id: nightly
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          tag="nightly-${GITHUB_RUN_NUMBER}-${short_sha}"
+          archive=".output/github-html-preview-${tag}-chrome.zip"
+          {
+            echo "short_sha=${short_sha}"
+            echo "tag=${tag}"
+            echo "archive=${archive}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build nightly archive
+        run: |
+          pnpm run zip
+          mv .output/github-html-preview-*-chrome.zip \
+            "${{ steps.nightly.outputs.archive }}"
+
+      - name: Install exact nightly archive
+        run: |
+          rm -rf .artifact-extension
+          mkdir .artifact-extension
+          unzip -q "${{ steps.nightly.outputs.archive }}" -d .artifact-extension
+
+      - name: Smoke exact nightly archive
+        env:
+          EXTENSION_PATH: ${{ github.workspace }}/.artifact-extension
+        run: pnpm exec playwright test --grep "blob preview embeds"
+
+      - name: Upload nightly diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-playwright-diagnostics
+          path: |
+            test-results/
+            playwright-report/
+          if-no-files-found: ignore
+
+      - name: Publish nightly prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.nightly.outputs.tag }}
+          SHORT_SHA: ${{ steps.nightly.outputs.short_sha }}
+          ARCHIVE: ${{ steps.nightly.outputs.archive }}
+        run: >-
+          gh release create "$TAG"
+          "$ARCHIVE"
+          --target "$GITHUB_SHA"
+          --prerelease
+          --title "GitHub HTML Preview Nightly $SHORT_SHA"
+          --notes "Automated prerelease from \`develop\` at \`$GITHUB_SHA\`. This build passed type-checking, unit tests, deterministic Chromium E2E, and exact-archive smoke testing."

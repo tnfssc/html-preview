@@ -56,10 +56,6 @@ body {
   border-bottom: 1px solid var(--gh-border-muted);
 }
 
-.popup-header svg {
-  flex-shrink: 0;
-}
-
 .popup-header h1 {
   margin: 0;
   font-size: 16px;
@@ -94,7 +90,6 @@ body {
   box-shadow: var(--gh-shadow-rest);
 }
 
-.section label,
 .section strong {
   display: block;
   font-size: 12px;
@@ -104,20 +99,9 @@ body {
 }
 
 
-button:focus-visible,
-input:focus-visible,
-a:focus-visible {
-  outline: 2px solid var(--accent);
+input:focus-visible {
+  outline: 2px solid var(--gh-fg-accent);
   outline-offset: 2px;
-}
-
-.warning-row {
-  align-items: flex-start;
-  padding: 10px;
-  border: 1px solid var(--gh-warning-fg);
-  border-radius: 6px;
-  background: var(--gh-warning-bg);
-  line-height: 1.4;
 }
 
 .section p {

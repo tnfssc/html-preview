@@ -11,7 +11,6 @@ import {
 } from '@/utils/storage';
 import type { BlobPageData } from '@/utils/github';
 import type { RepoRef, ResolveResult } from '@/utils/types';
-import { recordResolveMetrics } from '@/utils/metrics';
 import { debugError, debugLog } from '@/utils/debug';
 import {
   removePreviewSnapshot,
@@ -341,10 +340,6 @@ async function ensureResolved(route: RouteState): Promise<void> {
         signal: route.controller.signal,
       });
       route.controller.signal.throwIfAborted();
-      recordResolveMetrics(
-        result.performance.resolveMs,
-        result.performance.outputBytes,
-      );
       route.render = renderExecutablePreview(route.previewArea, result);
       try {
         route.snapshotId = await savePreviewSnapshot(

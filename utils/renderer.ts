@@ -4,7 +4,6 @@ import {
   postSandboxDocument,
 } from './sandboxProtocol';
 import { debugLog } from './debug';
-import { recordRenderMetrics } from './metrics';
 
 export interface RenderResult {
   iframe: HTMLIFrameElement;
@@ -82,7 +81,6 @@ export function renderExecutablePreview(
           outputBytes: result.performance.outputBytes,
           handshakeMs: Math.round(handshakeMs),
         });
-        recordRenderMetrics(handshakeMs);
       });
       return;
     }

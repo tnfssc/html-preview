@@ -19,7 +19,6 @@ import {
 import type { RepoRef } from '@/utils/types';
 import { debugError, debugLog } from '@/utils/debug';
 import { fetchWithRetry } from '@/utils/fetchWithRetry';
-import { recordResolveMetrics } from '@/utils/metrics';
 
 const PREVIEW_CONTROLS_CLASS = 'gh-html-preview-pr-controls';
 const RICH_CONTAINER_CLASS = 'gh-html-preview-pr-rich';
@@ -1496,10 +1495,6 @@ async function renderComparisonSide(
       signal,
     });
     signal.throwIfAborted();
-    recordResolveMetrics(
-      result.performance.resolveMs,
-      result.performance.outputBytes,
-    );
     state.retryableFailures +=
       result.resources.failed + result.resources.skipped;
     const onScroll = (position: ScrollPosition) => {

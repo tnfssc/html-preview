@@ -18,6 +18,10 @@ const DEFAULT_LIMITS: ResolveLimits = {
   maxOutputBytes: 40 * 1024 * 1024,
 };
 
+// Caps ES module graph recursion depth for private previews. The visited-set
+// (modules map) breaks cycles; this bounds deep import chains.
+const MAX_MODULE_DEPTH = 10;
+
 const MEDIA_TYPES: Record<string, string> = {
   avif: 'image/avif',
   bmp: 'image/bmp',
@@ -270,11 +274,19 @@ async function resolveSandboxDocument(
     ? sourcePath
     : sourcePath.slice(0, sourcePath.lastIndexOf('/') + 1);
   base.href = buildJsdelivrUrl(loader.repoRef, sourceDirectory);
+  const repoRoot = buildJsdelivrUrl(loader.repoRef, '');
+  // Per HTML spec, the first import map wins. Strip author-authored importmaps
+  // so the extension's mappings are not silently ignored.
+  doc.querySelectorAll('script[type="importmap"]').forEach((el) => el.remove());
   const importMap = doc.createElement('script');
   importMap.type = 'importmap';
+  // Scope the prefix mapping to repo-relative URL specifiers only. A broad
+  // `https://cdn.jsdelivr.net/` key would claim the entire jsDelivr origin
+  // and clobber external npm imports (e.g. `import 'https://cdn.jsdelivr.net/npm/react'`).
+  // Bare specifiers are left to the document's own import map or the browser default.
   importMap.textContent = JSON.stringify({
     imports: {
-      'https://cdn.jsdelivr.net/': buildJsdelivrUrl(loader.repoRef, ''),
+     [repoRoot]: repoRoot,
     },
   });
   doc.head.prepend(base, importMap);
@@ -311,7 +323,7 @@ async function resolveSandboxDocument(
   const moduleMap = await packageRepositoryScripts(doc, sourcePath, loader);
   importMap.textContent = JSON.stringify({
     imports: {
-      'https://cdn.jsdelivr.net/': buildJsdelivrUrl(loader.repoRef, ''),
+     [repoRoot]: repoRoot,
       ...moduleMap,
     },
   });
@@ -474,6 +486,7 @@ async function resolvePrivateSandboxDocument(
   const moduleMap = await packageRepositoryScripts(doc, sourcePath, loader);
 
   if (Object.keys(moduleMap).length > 0) {
+   doc.querySelectorAll('script[type="importmap"]').forEach((el) => el.remove());
     const importMap = doc.createElement('script');
     importMap.type = 'importmap';
     importMap.textContent = JSON.stringify({ imports: moduleMap });
@@ -494,7 +507,13 @@ function rewritePreviewLinks(
     const href = link.getAttribute('href');
     if (!href) continue;
     const resolved = resolveRepositoryUrl(href, repoRef, sourcePath);
-    if (resolved.kind === 'fragment') continue;
+    if (resolved.kind === 'fragment') {
+     // Fragment links navigate within the iframe; drop any source-authored
+     // target=_blank / rel=noreferrer so they do not open a new tab.
+     link.target = '_self';
+     link.removeAttribute('rel');
+     continue;
+    }
     if (resolved.kind === 'repo' && resolved.path !== undefined) {
       const path = resolved.path
         .split('/')
@@ -556,8 +575,10 @@ async function packageRepositoryScripts(
         loader,
         moduleMap,
         new Map<string, string>(),
+       0,
       );
     } catch (error) {
+     if (error instanceof DOMException && error.name === 'AbortError') throw error;
       loader.addDiagnostic(
         'inline-module-failed',
         error instanceof Error ? error.message : 'Inline module rewrite failed.',
@@ -569,6 +590,39 @@ async function packageRepositoryScripts(
   return moduleMap;
 }
 
+// Wraps an inlined @import sheet in the correct at-rule for its condition.
+// `@import url layer;`, `@import url supports(cond);` etc. are NOT media queries
+// and must not be wrapped in `@media`. `[^;]*` capture may yield a bare condition,
+// an `@layer`/`@supports` clause, or a media query list (optionally combined).
+function wrapImportedSheet(condition: string, nested: string): string {
+  const trimmed = condition.trim();
+  if (!trimmed) return nested;
+
+  const layerMatch = trimmed.match(/^layer\b(?:\s*\(([^)]*)\))?/i);
+  if (layerMatch) {
+    const name = layerMatch[1]?.trim();
+    const rest = trimmed.slice(layerMatch[0].length).trim();
+    const layerBlock = name
+      ? `@layer ${name} {\n${nested}\n}`
+      : `@layer {\n${nested}\n}`;
+    return rest ? `@media ${rest} {\n${layerBlock}\n}` : layerBlock;
+  }
+
+  const supportsMatch = trimmed.match(/^supports\(([\s\S]*?)\)/i);
+  if (supportsMatch) {
+    const cond = supportsMatch[1].trim();
+    const rest = trimmed.slice(supportsMatch[0].length).trim();
+    const supportsBlock = `@supports ${cond} {\n${nested}\n}`;
+    return rest ? `@media ${rest} {\n${supportsBlock}\n}` : supportsBlock;
+  }
+
+  // `scope()` is newer and has no broadly-supported inline form here;
+  // inline without a wrapper rather than emitting malformed CSS.
+  if (/^scope\(/i.test(trimmed)) return nested;
+
+  return `@media ${trimmed} {\n${nested}\n}`;
+}
+
 async function inlineRepositoryCss(
   css: string,
   sourcePath: string,
@@ -577,7 +631,7 @@ async function inlineRepositoryCss(
 ): Promise<string> {
   loader.stats.maxDepthReached = Math.max(loader.stats.maxDepthReached, depth);
   const importPattern =
-    /@import\s+(?:url\(\s*(["']?)(.*?)\1\s*\)|(["'])(.*?)\3)\s*([^;]*);/gi;
+    /@import\s+(?:url\(\s*(["']?)([\s\S]*?)\1\s*\)|(["'])([\s\S]*?)\3)\s*([^;]*);/gi;
   const imports = await replaceAsync(css, importPattern, async (match) => {
     const url = match[2] || match[4];
     const media = match[5]?.trim();
@@ -599,7 +653,7 @@ async function inlineRepositoryCss(
       depth + 1,
       loader,);
       loader.stats.inlined += 1;
-      return media ? `@media ${media} {\n${nested}\n}` : nested;
+     return wrapImportedSheet(media, nested);
     } catch (error) {
       recordResourceFailure(loader, url, error);
       return '';
@@ -613,7 +667,7 @@ async function rewritePrivateCssUrls(
   sourcePath: string,
   loader: ResourceLoader,
 ): Promise<string> {
-  const urlPattern = /url\(\s*(["']?)(.*?)\1\s*\)/gi;
+  const urlPattern = /url\(\s*(["']?)([\s\S]*?)\1\s*\)/gi;
   return replaceAsync(css, urlPattern, async (match) => {
     const url = match[2].trim();
     if (!url || url.startsWith('#')) return match[0];
@@ -673,7 +727,7 @@ async function buildPrivateModuleGraph(
 ): Promise<PrivateModuleGraph> {
   const imports: Record<string, string> = {};
   const modules = new Map<string, string>();
-  await collectPrivateModule(entryPath, loader, imports, modules);
+  await collectPrivateModule(entryPath, loader, imports, modules, 0);
   return {
     entry: imports[privateModuleUrl(entryPath)],
     imports,
@@ -685,8 +739,18 @@ async function collectPrivateModule(
   loader: ResourceLoader,
   imports: Record<string, string>,
   modules: Map<string, string>,
+  depth: number,
 ): Promise<void> {
   if (modules.has(path)) return;
+  if (depth >= MAX_MODULE_DEPTH) {
+    loader.stats.skipped += 1;
+    loader.addDiagnostic(
+      'module-depth-limit',
+      `Module import graph exceeded depth limit ${MAX_MODULE_DEPTH}.`,
+      path,
+    );
+    return;
+  }
   modules.set(path, '');
   const resource = await loader.load(path);
   const source = new TextDecoder().decode(resource.bytes);
@@ -696,6 +760,7 @@ async function collectPrivateModule(
     loader,
     imports,
     modules,
+    depth,
   );
   const dataUrl = resourceDataUrl(
     new TextEncoder().encode(transformed),
@@ -712,6 +777,7 @@ async function rewriteModuleSource(
   loader: ResourceLoader,
   imports: Record<string, string>,
   modules: Map<string, string>,
+  depth: number,
 ): Promise<string> {
   const [records] = parse(source);
   const replacements: Array<{ start: number; end: number; value: string }> = [];
@@ -731,7 +797,7 @@ async function rewriteModuleSource(
     if (resolved.kind !== 'repo' || !resolved.path) continue;
     const virtualUrl = privateModuleUrl(resolved.path);
     replacements.push({ start: record.s, end: record.e, value: virtualUrl });
-    await collectPrivateModule(resolved.path, loader, imports, modules);
+    await collectPrivateModule(resolved.path, loader, imports, modules, depth + 1);
   }
   let transformed = source;
   for (const replacement of replacements.sort((a, b) => b.start - a.start)) {
@@ -771,7 +837,7 @@ async function rewriteSandboxCss(
   loader: ResourceLoader,
 ): Promise<string> {
   const importPattern =
-    /@import\s+(?:url\(\s*(["']?)(.*?)\1\s*\)|(["'])(.*?)\3)\s*([^;]*);/gi;
+    /@import\s+(?:url\(\s*(["']?)([\s\S]*?)\1\s*\)|(["'])([\s\S]*?)\3)\s*([^;]*);/gi;
   const importsRewritten = await replaceAsync(
     css,
     importPattern,
@@ -805,7 +871,7 @@ async function rewriteCssUrls(
   sourcePath: string,
   loader: ResourceLoader,
 ): Promise<string> {
-  const urlPattern = /url\(\s*(["']?)(.*?)\1\s*\)/gi;
+  const urlPattern = /url\(\s*(["']?)([\s\S]*?)\1\s*\)/gi;
   return replaceAsync(css, urlPattern, async (match) => {
     const url = match[2].trim();
     if (!url || url.startsWith('#')) return match[0];

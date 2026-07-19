@@ -216,10 +216,6 @@ export function extractBlobPageData(): BlobPageData {
   }
 }
 
-export function extractRawHtmlFromPage(): string | null {
-  return extractBlobPageData().html;
-}
-
 export function buildRawUrl(repoRef: RepoRef): string {
   return `https://raw.githubusercontent.com/${encodeURIComponent(repoRef.owner)}/${encodeURIComponent(repoRef.repo)}/${encodeURIComponent(repoRef.ref)}/${encodePath(repoRef.path)}`;
 }

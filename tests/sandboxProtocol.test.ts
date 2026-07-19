@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  SANDBOX_READY,
+  isSandboxReadyMessage,
   isSandboxRenderMessage,
   postSandboxDocument,
 } from '../utils/sandboxProtocol';
@@ -23,5 +25,87 @@ describe('sandbox document transport', () => {
     expect(Math.max(...typed.map((message) => message.chunk.length))).toBe(
       64 * 1024,
     );
+  });
+});
+
+describe('isSandboxReadyMessage', () => {
+  it('accepts a valid ready message', () => {
+    const message = { kind: SANDBOX_READY, channel: 'channel-abc' };
+    expect(isSandboxReadyMessage(message)).toBe(true);
+  });
+
+  it('narrows the type for a valid ready message', () => {
+    const message: unknown = { kind: SANDBOX_READY, channel: 'channel-abc' };
+    if (isSandboxReadyMessage(message)) {
+      expect(message.kind).toBe(SANDBOX_READY);
+      expect(message.channel).toBe('channel-abc');
+    } else {
+      throw new Error('expected discriminator to accept a valid ready message');
+    }
+  });
+
+  it('rejects null', () => {
+    expect(isSandboxReadyMessage(null)).toBe(false);
+  });
+
+  it('rejects arrays', () => {
+    expect(isSandboxReadyMessage([SANDBOX_READY, 'channel-abc'])).toBe(false);
+  });
+
+  it('rejects primitives', () => {
+    expect(isSandboxReadyMessage(undefined)).toBe(false);
+    expect(isSandboxReadyMessage(42)).toBe(false);
+    expect(isSandboxReadyMessage('sandbox-ready')).toBe(false);
+    expect(isSandboxReadyMessage(true)).toBe(false);
+  });
+
+  it('rejects an object missing the kind field', () => {
+    expect(isSandboxReadyMessage({ channel: 'channel-abc' })).toBe(false);
+  });
+
+  it('rejects an object with the wrong kind', () => {
+    expect(
+      isSandboxReadyMessage({
+        kind: 'gh-html-preview:sandbox-render',
+        channel: 'channel-abc',
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects an object missing the channel field', () => {
+    expect(isSandboxReadyMessage({ kind: SANDBOX_READY })).toBe(false);
+  });
+
+  it('rejects a non-string channel', () => {
+    expect(
+      isSandboxReadyMessage({ kind: SANDBOX_READY, channel: 123 }),
+    ).toBe(false);
+    expect(
+      isSandboxReadyMessage({ kind: SANDBOX_READY, channel: null }),
+    ).toBe(false);
+    expect(
+      isSandboxReadyMessage({ kind: SANDBOX_READY, channel: { x: 1 } }),
+    ).toBe(false);
+  });
+
+  it('ignores extra fields when kind and channel are valid', () => {
+    expect(
+      isSandboxReadyMessage({
+        kind: SANDBOX_READY,
+        channel: 'channel-abc',
+        extra: 'ignored',
+      }),
+    ).toBe(true);
+  });
+
+  it('does not accept a render message as a ready message', () => {
+    const renderMessage = {
+      kind: 'gh-html-preview:sandbox-render',
+      channel: 'channel-abc',
+      index: 0,
+      total: 1,
+      chunk: 'x',
+    };
+    expect(isSandboxReadyMessage(renderMessage)).toBe(false);
   });
 });

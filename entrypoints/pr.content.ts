@@ -489,6 +489,7 @@ async function fetchSessionCommitMetadata(
       !response.ok ||
       new URL(response.url).origin !== 'https://github.com'
     ) {
+      await response.body?.cancel();
       return null;
     }
     const documentNode = new DOMParser().parseFromString(
@@ -1072,7 +1073,7 @@ function insertPreviewControls(
   const base = createComparisonPane();
   const head = createComparisonPane();
   comparisonArea.append(base.pane, head.pane);
-  container.append(status, reloadButton, comparisonArea);
+  container.append(toolbar, status, reloadButton, comparisonArea);
   target.fileContent.before(container);
   target.actions.prepend(controls);
 
@@ -1135,7 +1136,9 @@ function insertPreviewControls(
     resolving: null,
     mode: 'source',
   };
-  const collapseButton = target.header.querySelector<HTMLButtonElement>('button');
+  const collapseButton = target.header.querySelector<HTMLButtonElement>(
+    'button[aria-expanded], button[aria-label*="collapse" i]',
+  );
   if (collapseButton) {
     const handleCollapse = () => {
       const labelledBy = collapseButton.getAttribute('aria-labelledby');
@@ -1298,6 +1301,10 @@ function hideCodeDiff(state: RichDiffState): void {
       .map((comment) => comment.closest<HTMLElement>('tr'))
       .filter((row): row is HTMLElement => row !== null),
   );
+  if (commentRows.size === 0) {
+    state.target.fileContent.style.setProperty('display', 'none', 'important');
+    return;
+  }
   for (const row of state.target.fileContent.querySelectorAll<HTMLElement>('tr')) {
     if (commentRows.has(row)) continue;
     row.style.setProperty('display', 'none', 'important');
@@ -1553,7 +1560,12 @@ async function getDiffFileInfo(
   routeState: DiffRouteState,
   path: string,
 ): Promise<DiffFileInfo | null> {
-  routeState.fileMetadata ??= fetchDiffFiles(routeState);
+  routeState.fileMetadata ??= fetchDiffFiles(routeState).catch(
+    (error: unknown) => {
+      routeState.fileMetadata = null;
+      throw error;
+    },
+  );
   const files = await routeState.fileMetadata;
   return (
     files.find(
@@ -1566,7 +1578,12 @@ async function getDiffFileInfo(
 async function getDiffFiles(
   routeState: DiffRouteState,
 ): Promise<DiffFileInfo[]> {
-  routeState.fileMetadata ??= fetchDiffFiles(routeState);
+  routeState.fileMetadata ??= fetchDiffFiles(routeState).catch(
+    (error: unknown) => {
+      routeState.fileMetadata = null;
+      throw error;
+    },
+  );
   return routeState.fileMetadata;
 }
 
@@ -1803,7 +1820,7 @@ async function captureComparisonScreenshot(
     download.href = url;
     download.download = `${path.split('/').pop() ?? 'html-comparison'}.png`;
     download.click();
-    setTimeout(() => URL.revokeObjectURL(url), 0);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   } finally {
     for (const track of stream.getTracks()) track.stop();
   }

@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 const [tag, manifestPath = '.output/chrome-mv3/manifest.json'] = process.argv.slice(2);
 if (!tag) throw new Error('Usage: verify-release-version.mjs <tag> [manifest]');
 
-const match = /^v(\d+\.\d+\.\d+)(?:-debug\.(\d+))?$/.exec(tag);
+const match = /^v(\d+\.\d+\.\d+)(?:-debug\.\d+)?$/.exec(tag);
 if (!match) {
   throw new Error(`Unsupported release tag ${tag}. Use vX.Y.Z or vX.Y.Z-debug.N.`);
 }

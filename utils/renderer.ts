@@ -46,18 +46,14 @@ export function renderExecutablePreview(
   iframe.style.height = options?.height ?? '100%';
   iframe.style.display = 'block';
   iframe.style.border = 'none';
-  iframe.style.minHeight = '0';
   container.replaceChildren(iframe);
   const htmlReady = options?.onScroll
     ? installScrollBridge(result.html, channel).catch(() => result.html)
     : Promise.resolve(result.html);
   let renderSent = false;
-  iframe.src = (browser.runtime.getURL as (path: string) => string)(
-    `/sandbox.html#${new URLSearchParams({ channel }).toString()}`,
-  );
+  let destroyed = false;
 
   const receiveScroll = (event: MessageEvent<unknown>) => {
-
     if (
       event.source !== iframe.contentWindow ||
       typeof event.data !== 'object' ||
@@ -74,6 +70,7 @@ export function renderExecutablePreview(
     ) {
       renderSent = true;
       void htmlReady.then((html) => {
+        if (destroyed) return;
         if (iframe.contentWindow) {
           postSandboxDocument(iframe.contentWindow, channel, html);
         }
@@ -100,6 +97,9 @@ export function renderExecutablePreview(
     }
   };
   window.addEventListener('message', receiveScroll);
+  iframe.src = (browser.runtime.getURL as (path: string) => string)(
+    `/sandbox.html#${new URLSearchParams({ channel }).toString()}`,
+  );
 
   return {
     iframe,
@@ -116,6 +116,7 @@ export function renderExecutablePreview(
       );
     },
     destroy: () => {
+      destroyed = true;
       window.removeEventListener('message', receiveScroll);
       iframe.src = 'about:blank';
       iframe.remove();
@@ -212,10 +213,12 @@ async function installScrollBridge(
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['id', 'name'],
+      attributeFilter: ['id', 'name', 'style', 'class'],
     });
-    new ResizeObserver(() => { anchorsDirty = true; })
-      .observe(document.documentElement);
+    const resizeObserver = new ResizeObserver(() => { anchorsDirty = true; });
+    resizeObserver.observe(document.documentElement);
+    if (document.body) resizeObserver.observe(document.body);
+    addEventListener('pageshow', () => { anchorsDirty = true; });
     addEventListener('scroll', () => {
       if (applying || scheduled) return;
       scheduled = true;
@@ -276,10 +279,29 @@ async function installScrollBridge(
     String.fromCharCode(...new Uint8Array(hash)),
   );
   if (csp) {
-    csp.content = csp.content.replace(
-      "script-src 'none'",
-      `script-src 'sha256-${hashBase64}'`,
-    );
+    const directives = csp.content
+      .split(';')
+      .map((part) => part.trim())
+      .filter(Boolean);
+    const matchesDirective = (name: string) => (directive: string) =>
+      new RegExp(`^${name}(?:\\s|$)`, 'i').test(directive);
+    const scriptIndex = directives.findIndex(matchesDirective('script-src'));
+    if (scriptIndex !== -1) {
+      const parts = directives[scriptIndex].split(/\s+/);
+      const directiveName = parts[0];
+      const sources = parts.slice(1).filter((source) => source !== "'none'");
+      sources.push(`'sha256-${hashBase64}'`);
+      directives[scriptIndex] = [directiveName, ...sources].join(' ');
+    } else {
+      const defaultIndex = directives.findIndex(matchesDirective('default-src'));
+      const newDirective = `script-src 'sha256-${hashBase64}'`;
+      if (defaultIndex !== -1) {
+        directives.splice(defaultIndex + 1, 0, newDirective);
+      } else {
+        directives.push(newDirective);
+      }
+    }
+    csp.content = directives.join('; ');
   }
   documentNode.body.appendChild(script);
   return `<!doctype html>\n${documentNode.documentElement.outerHTML}`;
@@ -301,6 +323,7 @@ function parseScrollAnchor(value: unknown): ScrollAnchor | undefined {
     (anchor.nextKey !== null && typeof anchor.nextKey !== 'string') ||
     typeof anchor.progress !== 'number' ||
     typeof anchor.offset !== 'number' ||
+    !Number.isFinite(anchor.progress) ||
     !Number.isFinite(anchor.offset)
   ) {
     return undefined;

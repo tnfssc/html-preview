@@ -185,7 +185,7 @@ describe('sandbox preview', () => {
       JSON.parse(
         doc.querySelector('script[type="importmap"]')?.textContent ?? '{}',
       ).imports,
-    ).toMatchObject({ 'https://cdn.jsdelivr.net/': cdnRoot });
+    ).toMatchObject({ [cdnRoot]: cdnRoot });
     const stylesheet = doc.querySelector<HTMLLinkElement>(
       'link[rel~="stylesheet"]',
     );

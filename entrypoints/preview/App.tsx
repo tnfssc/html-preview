@@ -30,10 +30,15 @@ function buildGitHubUrl(repoRef: RepoRef): string {
 
 export default function App(): React.JSX.Element {
   const [snapshotId] = useState(parseSnapshotId);
-  const [state, setState] = useState<LoadState>({
-    kind: 'loading',
-    message: 'Loading packaged preview…',
-  });
+  const [state, setState] = useState<LoadState>(
+    snapshotId
+      ? { kind: 'loading', message: 'Loading packaged preview…' }
+      : {
+          kind: 'error',
+          message: 'Missing or invalid preview snapshot.',
+        },
+  );
+  const [copyError, setCopyError] = useState(false);
 
   useEffect(() => {
     if (!snapshotId) {
@@ -79,6 +84,23 @@ export default function App(): React.JSX.Element {
       }
     })();
   }, [snapshotId]);
+
+  const handleCopyDiagnostics = async () => {
+    const text =
+      state.result?.diagnostics
+        .map((diagnostic) =>
+          diagnostic.url
+            ? `${diagnostic.code} ${diagnostic.url}: ${diagnostic.message}`
+            : `${diagnostic.code}: ${diagnostic.message}`,
+        )
+        .join('\n') ?? '';
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      setCopyError(true);
+      window.setTimeout(() => setCopyError(false), 2000);
+    }
+  };
 
   if (!snapshotId) {
     return <main className="error">Error: {state.message}</main>;
@@ -141,21 +163,8 @@ export default function App(): React.JSX.Element {
               </li>
             ))}
           </ul>
-          <button
-            type="button"
-            onClick={() =>
-              void navigator.clipboard.writeText(
-                state.result?.diagnostics
-                  .map((diagnostic) =>
-                    diagnostic.url
-                      ? `${diagnostic.code} ${diagnostic.url}: ${diagnostic.message}`
-                      : `${diagnostic.code}: ${diagnostic.message}`,
-                  )
-                  .join('\n') ?? '',
-              )
-            }
-          >
-            Copy diagnostics
+          <button type="button" onClick={() => void handleCopyDiagnostics()}>
+            {copyError ? 'Copy failed' : 'Copy diagnostics'}
           </button>
         </details>
       )}
@@ -201,6 +210,7 @@ function SandboxFrame({ html }: { html: string }): React.JSX.Element {
   const [handshakeError, setHandshakeError] = useState<string | null>(null);
 
   useEffect(() => {
+    setHandshakeError(null);
     const host = hostRef.current;
     if (!host) return;
     const channelBytes = crypto.getRandomValues(new Uint8Array(16));
@@ -255,7 +265,11 @@ function SandboxFrame({ html }: { html: string }): React.JSX.Element {
 
   return (
     <>
-      {handshakeError && <div className="error">{handshakeError}</div>}
+      {handshakeError && (
+        <div className="error" role="alert">
+          {handshakeError}
+        </div>
+      )}
       <div ref={hostRef} className="preview-host" />
     </>
   );

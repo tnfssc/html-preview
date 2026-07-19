@@ -11,9 +11,7 @@ node_modules
 .output
 .env
 .agents
-.docs
 .project
-PRODUCT.md
 skills-lock.json
 test-results
 playwright-report

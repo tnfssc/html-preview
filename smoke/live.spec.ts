@@ -6,12 +6,29 @@ const blobUrl =
 const prUrl = 'https://github.com/mdn/learning-area/pull/846/files';
 const prHtmlPath =
   'javascript/introduction-to-js-1/troubleshooting/number-game-errors.html';
-const prHead = {
-  owner: 'yousukka',
-  repo: 'learning-area',
-  ref: 'e5e4d64e01cb59988514779a5203b0e762c6c3a8',
-};
 const liveTimeout = 30_000;
+
+test.beforeAll(async () => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5_000);
+  let reachable = false;
+  try {
+    const response = await fetch('https://github.com', {
+      method: 'HEAD',
+      signal: controller.signal,
+      redirect: 'follow',
+    });
+    reachable = response.ok;
+  } catch {
+    reachable = false;
+  } finally {
+    clearTimeout(timeout);
+  }
+  test.skip(
+    !reachable,
+    'Live smoke tests require network access to github.com (offline or rate-limited).',
+  );
+});
 
 test('current GitHub blob UI renders repository CSS in a sandboxed preview', async () => {
   test.setTimeout(90_000);
@@ -56,14 +73,14 @@ test('current GitHub blob UI renders repository CSS in a sandboxed preview', asy
     expect((await container.boundingBox())?.height).toBeGreaterThanOrEqual(600);
     expect((await iframe.boundingBox())?.height).toBeGreaterThanOrEqual(500);
 
-    const folder = page.locator(
-      '[id="html/introduction-to-html/creating-hyperlinks-item"]',
-    );
+    const folder = page.getByRole('treeitem', {
+      name: /^creating-hyperlinks$/,
+    });
     await folder.focus();
     await page.keyboard.press('ArrowRight');
-    const nextFile = page.locator(
-      '[id="html/introduction-to-html/creating-hyperlinks/index.html-item"] .PRIVATE_TreeView-item-content',
-    );
+    const nextFile = page.getByRole('treeitem', {
+      name: 'index.html',
+    });
     await expect(nextFile).toBeVisible({ timeout: liveTimeout });
     await nextFile.click();
     await expect(page).toHaveURL(/\/creating-hyperlinks\/index\.html$/);

@@ -84,10 +84,18 @@ export default defineContentScript({
       removeOrphanedUi();
     };
 
-    const showCode = (selectedButton?: HTMLButtonElement) => {
+    const showCode = () => {
       if (!state) return;
       state.active = false;
-      setSelectedTab(state.tabBar, selectedButton ?? null);
+      // Only deselect the Preview tab; GitHub's React state manages native
+      // tab buttons and overrides aria-current/data-selected on re-render.
+      state.tabButton.setAttribute('aria-current', 'false');
+      state.tabButton.setAttribute('aria-selected', 'false');
+      state.tabButton.style.setProperty(
+        '--separator-color',
+        'var(--borderColor-default)',
+      );
+      state.tab.removeAttribute('data-selected');
       state.container.style.setProperty('display', 'none', 'important');
       state.codeView.style.removeProperty('display');
       debugLog('blob', 'show-code', { path: state.repoRef.path });
@@ -197,7 +205,7 @@ export default defineContentScript({
         tabBar.querySelectorAll<HTMLButtonElement>('button'),
       )) {
         if (nativeButton === button) continue;
-        const listener = () => showCode(nativeButton);
+        const listener = () => showCode();
         nativeButton.addEventListener('click', listener);
         nativeListenerCleanup.push(() =>
           nativeButton.removeEventListener('click', listener),
@@ -233,6 +241,8 @@ export default defineContentScript({
         state &&
         (state.key !== key ||
           !state.container.isConnected ||
+         !state.tab.isConnected ||
+         !state.tabBar.isConnected ||
           (pageData.html !== null && pageData.html !== state.sourceHtml))
       ) {
         teardown();
@@ -272,7 +282,11 @@ export default defineContentScript({
         scheduleReconcile();
         return;
       }
-      const disconnected = state !== null && !state.container.isConnected;
+      const disconnected =
+       state !== null &&
+       (!state.container.isConnected ||
+         !state.tab.isConnected ||
+         !state.tabBar.isConnected);
       const relevant = mutations.some((mutation) =>
         Array.from(mutation.addedNodes).some(
           (node) =>

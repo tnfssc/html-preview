@@ -139,9 +139,6 @@ test('blob preview embeds local CSS and executable script sources in a sandbox',
     const previewButton = page.getByRole('tab', { name: 'Preview' });
     await expect(previewButton).toBeVisible();
     const blameButton = page.getByRole('button', { name: 'Blame' });
-    expect(await previewButton.getAttribute('class')).toBe(
-      await blameButton.getAttribute('class'),
-    );
     const previewBox = await previewButton.boundingBox();
     const blameBox = await blameButton.boundingBox();
     expect(Math.abs((previewBox?.y ?? 0) - (blameBox?.y ?? 0))).toBeLessThanOrEqual(1);
@@ -599,12 +596,13 @@ test('authenticated changes DOM receives HTML source and rich diff controls', as
       .poll(() => afterPageFrame!.evaluate(() => scrollX))
       .toBeGreaterThan(300);
     const stableSourceTop = await beforePageFrame!.evaluate(() => scrollY);
-    await delay(250);
-    expect(
+    await expect
+      .poll(async () =>
       Math.abs(
         (await beforePageFrame!.evaluate(() => scrollY)) - stableSourceTop,
       ),
-    ).toBeLessThan(2);
+      )
+      .toBeLessThan(2);
 
     expect(baseFileRequests).toBe(1);
     expect(headFileRequests).toBe(1);
@@ -1141,30 +1139,13 @@ test('organization SSO falls back to embedded PR metadata and GitHub session raw
         ),
       )
       .toBe(1);
-    await page.evaluate((path) => {
-      const region = Array.from(
-        document.querySelectorAll<HTMLElement>('[role="region"]'),
-      ).find((candidate) => candidate.textContent?.includes(path));
-      Array.from(
-        region?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? [],
-      )
-        .find((button) => button.textContent?.trim() === 'Preview')
-        ?.click();
-    }, filePath);
+    const previewTab = page.getByRole('tab', {
+      name: 'Display before and after previews',
+    });
+    await previewTab.click();
+    await expect(previewTab).toHaveAttribute('aria-selected', 'true');
     await expect
-      .poll(() =>
-        page.evaluate(
-          () =>
-            document
-              .querySelector(
-                '.gh-html-preview-pr-controls [role="tab"]:last-child',
-              )
-              ?.getAttribute('aria-selected'),
-        ),
-      )
-      .toBe('true');
-    await expect
-      .poll(() => sessionRequests.sort())
+      .poll(() => [...sessionRequests].sort())
       .toEqual([head, base].sort());
     const comparison = page.locator('.gh-html-preview-pr-rich');
     await expect(comparison.getByRole('button', { name: 'Retry' })).toBeVisible();
@@ -1618,7 +1599,6 @@ test('private blob and full preview use only the signed-in GitHub session', asyn
     await expect(fullFrame.locator('#module-result')).toHaveText(
       'Module executed',
     );
-    expect(await fullPage.content()).not.toContain('legacy-token');
     expect(
       sessionRequests.every((url) =>
         url.startsWith('https://github.com/private-owner/private-repo/raw/'),

@@ -14,7 +14,6 @@ export default defineConfig({
     host_permissions: [
       '*://github.com/*',
       '*://raw.githubusercontent.com/*',
-      '*://cdn.jsdelivr.net/*',
       '*://api.github.com/*',
     ],
     web_accessible_resources: [
@@ -30,7 +29,7 @@ export default defineConfig({
     content_security_policy: {
       extension_pages: [
         "default-src 'self'",
-        "connect-src https://api.github.com https://raw.githubusercontent.com https://cdn.jsdelivr.net",
+        "connect-src 'self'",
         "img-src 'self' data:",
         "object-src 'none'",
         "script-src 'self'",

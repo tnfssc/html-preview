@@ -78,7 +78,7 @@ test('current GitHub blob UI renders repository CSS in a sandboxed preview', asy
     });
     await folder.focus();
     await page.keyboard.press('ArrowRight');
-    const nextFile = page.getByRole('treeitem', {
+    const nextFile = folder.getByRole('treeitem', {
       name: 'index.html',
     });
     await expect(nextFile).toBeVisible({ timeout: liveTimeout });

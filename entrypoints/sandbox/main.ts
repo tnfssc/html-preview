@@ -6,6 +6,7 @@ import { debugLog } from '@/utils/debug';
 
 const parameters = new URLSearchParams(location.hash.slice(1));
 const channel = parameters.get('channel');
+const instance = crypto.randomUUID();
 
 if (!channel) {
   document.body.textContent = 'Invalid preview handshake.';
@@ -15,7 +16,7 @@ if (!channel) {
   let received = 0;
   const announce = () => {
     attempts += 1;
-    parent.postMessage({ kind: SANDBOX_READY, channel }, '*');
+    parent.postMessage({ kind: SANDBOX_READY, channel, instance }, '*');
     if (attempts === 1) debugLog('sandbox', 'ready-announced');
     if (attempts >= 40) window.clearInterval(announceTimer);
   };

@@ -49,7 +49,7 @@ export function renderExecutablePreview(
   const htmlReady = options?.onScroll
     ? installScrollBridge(result.html, channel).catch(() => result.html)
     : Promise.resolve(result.html);
-  let renderSent = false;
+  let renderedInstance: string | null = null;
   let destroyed = false;
 
   const receiveScroll = (event: MessageEvent<unknown>) => {
@@ -65,9 +65,9 @@ export function renderExecutablePreview(
     if (
       isSandboxReadyMessage(data) &&
       data.channel === channel &&
-      !renderSent
+      data.instance !== renderedInstance
     ) {
-      renderSent = true;
+      renderedInstance = data.instance;
       void htmlReady.then((html) => {
         if (destroyed) return;
         if (iframe.contentWindow) {

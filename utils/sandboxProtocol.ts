@@ -4,6 +4,7 @@ export const SANDBOX_RENDER = 'gh-html-preview:sandbox-render' as const;
 export interface SandboxReadyMessage {
   kind: typeof SANDBOX_READY;
   channel: string;
+  instance: string;
 }
 
 export interface SandboxRenderMessage {
@@ -21,7 +22,11 @@ export function isSandboxReadyMessage(
     return false;
   }
   const record = value as Record<string, unknown>;
-  return record.kind === SANDBOX_READY && typeof record.channel === 'string';
+  return (
+    record.kind === SANDBOX_READY &&
+    typeof record.channel === 'string' &&
+    typeof record.instance === 'string'
+  );
 }
 
 export function isSandboxRenderMessage(

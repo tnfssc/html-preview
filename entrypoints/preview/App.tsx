@@ -225,18 +225,18 @@ function SandboxFrame({ html }: { html: string }): React.JSX.Element {
       'allow-scripts allow-forms allow-modals allow-popups allow-downloads',
     );
 
-    let completed = false;
+    let completedInstance: string | null = null;
     const receiveReady = (event: MessageEvent<unknown>) => {
       if (
         event.source !== iframe.contentWindow ||
         event.origin !== 'null' ||
         !isSandboxReadyMessage(event.data) ||
         event.data.channel !== channel ||
-        completed
+        event.data.instance === completedInstance
       ) {
         return;
       }
-      completed = true;
+      completedInstance = event.data.instance;
       debugLog('preview', 'sandbox-ready', { htmlBytes: html.length });
       if (iframe.contentWindow) {
         postSandboxDocument(iframe.contentWindow, channel, html);
@@ -249,7 +249,7 @@ function SandboxFrame({ html }: { html: string }): React.JSX.Element {
     host.replaceChildren(iframe);
 
     const timeout = window.setTimeout(() => {
-      if (!completed) {
+      if (!completedInstance) {
         const error = new Error('Sandbox did not accept preview content.');
         debugError('preview', 'sandbox-timeout', error);
         setHandshakeError(error.message);

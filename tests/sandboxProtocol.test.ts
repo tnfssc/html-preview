@@ -30,15 +30,24 @@ describe('sandbox document transport', () => {
 
 describe('isSandboxReadyMessage', () => {
   it('accepts a valid ready message', () => {
-    const message = { kind: SANDBOX_READY, channel: 'channel-abc' };
+    const message = {
+      kind: SANDBOX_READY,
+      channel: 'channel-abc',
+      instance: 'instance-123',
+    };
     expect(isSandboxReadyMessage(message)).toBe(true);
   });
 
   it('narrows the type for a valid ready message', () => {
-    const message: unknown = { kind: SANDBOX_READY, channel: 'channel-abc' };
+    const message: unknown = {
+      kind: SANDBOX_READY,
+      channel: 'channel-abc',
+      instance: 'instance-123',
+    };
     if (isSandboxReadyMessage(message)) {
       expect(message.kind).toBe(SANDBOX_READY);
       expect(message.channel).toBe('channel-abc');
+      expect(message.instance).toBe('instance-123');
     } else {
       throw new Error('expected discriminator to accept a valid ready message');
     }
@@ -68,31 +77,66 @@ describe('isSandboxReadyMessage', () => {
       isSandboxReadyMessage({
         kind: 'gh-html-preview:sandbox-render',
         channel: 'channel-abc',
+        instance: 'instance-123',
       }),
     ).toBe(false);
   });
 
   it('rejects an object missing the channel field', () => {
-    expect(isSandboxReadyMessage({ kind: SANDBOX_READY })).toBe(false);
+    expect(
+      isSandboxReadyMessage({
+        kind: SANDBOX_READY,
+        instance: 'instance-123',
+      }),
+    ).toBe(false);
   });
 
   it('rejects a non-string channel', () => {
     expect(
-      isSandboxReadyMessage({ kind: SANDBOX_READY, channel: 123 }),
+      isSandboxReadyMessage({
+        kind: SANDBOX_READY,
+        channel: 123,
+        instance: 'instance-123',
+      }),
     ).toBe(false);
     expect(
-      isSandboxReadyMessage({ kind: SANDBOX_READY, channel: null }),
+      isSandboxReadyMessage({
+        kind: SANDBOX_READY,
+        channel: null,
+        instance: 'instance-123',
+      }),
     ).toBe(false);
     expect(
-      isSandboxReadyMessage({ kind: SANDBOX_READY, channel: { x: 1 } }),
+      isSandboxReadyMessage({
+        kind: SANDBOX_READY,
+        channel: { x: 1 },
+        instance: 'instance-123',
+      }),
     ).toBe(false);
   });
 
-  it('ignores extra fields when kind and channel are valid', () => {
+  it('rejects a missing or non-string instance', () => {
     expect(
       isSandboxReadyMessage({
         kind: SANDBOX_READY,
         channel: 'channel-abc',
+      }),
+    ).toBe(false);
+    expect(
+      isSandboxReadyMessage({
+        kind: SANDBOX_READY,
+        channel: 'channel-abc',
+        instance: 123,
+      }),
+    ).toBe(false);
+  });
+
+  it('ignores extra fields when kind, channel, and instance are valid', () => {
+    expect(
+      isSandboxReadyMessage({
+        kind: SANDBOX_READY,
+        channel: 'channel-abc',
+        instance: 'instance-123',
         extra: 'ignored',
       }),
     ).toBe(true);

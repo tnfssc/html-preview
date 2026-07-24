@@ -1059,6 +1059,127 @@ test('private PR first load recovers metadata from the signed-in GitHub page', a
   }
 });
 
+test('private PR renders each added HTML file through the GitHub session', async () => {
+  const { context, page } = await launchWithExtension();
+  const filePaths = ['private/first.html', 'private/second.html'];
+  const base = 'c'.repeat(40);
+  const head = 'd'.repeat(40);
+  const prUrl = 'https://github.com/acme/reports/pull/62/changes';
+  const files = filePaths
+    .map(
+      (filePath) => `<div class="file" data-path="${filePath}">
+        <div class="file-header" data-path="${filePath}">
+          <div class="file-actions"><div class="d-flex"></div></div>
+        </div>
+        <div class="js-file-content">Source diff for ${filePath}</div>
+      </div>`,
+    )
+    .join('');
+  const firstPage = `<!doctype html><html><body><div id="files">${files}</div></body></html>`;
+  const embedded = JSON.stringify({
+    payload: {
+      pullRequestsChangesRoute: {
+        comparison: { fullDiff: { baseOid: base, headOid: head } },
+        pullRequest: {
+          comparison: { baseOid: base, headOid: head },
+          headRepositoryOwnerLogin: 'acme',
+          headRepositoryName: 'reports',
+        },
+        diffContents: filePaths.map((path) => ({
+          path,
+          status: 'ADDED',
+          oldTreeEntry: null,
+        })),
+      },
+    },
+  }).replaceAll('<', '\\u003c');
+  const sessionPage = firstPage.replace(
+    '</body>',
+    `<script type="application/json" data-target="react-app.embeddedData">${embedded}</script></body>`,
+  );
+  try {
+    await context.route('**/*', async (route) => {
+      const url = route.request().url();
+      if (url === prUrl) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body:
+            route.request().resourceType() === 'document'
+              ? firstPage
+              : sessionPage,
+        });
+        return;
+      }
+      if (
+        url === 'https://api.github.com/repos/acme/reports/pulls/62' ||
+        url ===
+          'https://api.github.com/repos/acme/reports/pulls/62/files?per_page=100'
+      ) {
+        await route.fulfill({ status: 404, json: { message: 'Not Found' } });
+        return;
+      }
+      for (const [index, filePath] of filePaths.entries()) {
+        if (url === `https://github.com/acme/reports/raw/${base}/${filePath}`) {
+          await route.fulfill({ status: 404, body: 'Not Found' });
+          return;
+        }
+        if (url === `https://github.com/acme/reports/raw/${head}/${filePath}`) {
+          await route.fulfill({
+            status: 200,
+            contentType: 'text/plain',
+            body: `<!doctype html><html><body><h1 id="private-added-${index + 1}">Private added ${index + 1}</h1></body></html>`,
+          });
+          return;
+        }
+      }
+      if (url.startsWith('chrome-extension://')) {
+        await route.continue();
+        return;
+      }
+      await route.abort();
+    });
+
+    await page.goto(prUrl);
+    for (const [index, filePath] of filePaths.entries()) {
+      const file = page.locator(`.file[data-path="${filePath}"]`);
+      await file
+        .getByRole('tab', { name: 'Display before and after previews' })
+        .click();
+      const frame = file
+        .locator(`iframe[title="After HTML preview for ${filePath}"]`)
+        .contentFrame();
+      await expect(frame.locator(`#private-added-${index + 1}`)).toHaveText(
+        `Private added ${index + 1}`,
+      );
+    }
+
+    const reloadedIframe = page.locator(
+      `iframe[title="After HTML preview for ${filePaths[1]}"]`,
+    );
+    await reloadedIframe
+      .contentFrame()
+      .locator('body')
+      .evaluate((body) => {
+        body.dataset.testGeneration = 'old';
+      });
+    await reloadedIframe.evaluate((iframe) => {
+      const source = iframe.getAttribute('src');
+      if (!source) throw new Error('Preview iframe source missing.');
+      iframe.setAttribute('src', source);
+    });
+    await expect(reloadedIframe.contentFrame().locator('body')).not.toHaveAttribute(
+      'data-test-generation',
+      'old',
+    );
+    await expect(
+      reloadedIframe.contentFrame().locator('#private-added-2'),
+    ).toHaveText('Private added 2');
+  } finally {
+    await context.close();
+  }
+});
+
 test('organization SSO falls back to embedded PR metadata and GitHub session raw files', async () => {
   const { context, page } = await launchWithExtension();
   const filePath = 'enterprise/report.html';

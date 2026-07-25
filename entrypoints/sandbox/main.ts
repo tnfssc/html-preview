@@ -3,6 +3,10 @@ import {
   isSandboxRenderMessage,
 } from '@/utils/sandboxProtocol';
 import { debugLog } from '@/utils/debug';
+import {
+  installAnnotations,
+  notifyAnnotationsRendered,
+} from '@/entrypoints/sandbox/annotations';
 
 const parameters = new URLSearchParams(location.hash.slice(1));
 const channel = parameters.get('channel');
@@ -11,6 +15,7 @@ const instance = crypto.randomUUID();
 if (!channel) {
   document.body.textContent = 'Invalid preview handshake.';
 } else {
+  installAnnotations(channel);
   let attempts = 0;
   let chunks: string[] | null = null;
   let received = 0;
@@ -49,6 +54,7 @@ if (!channel) {
     document.open();
     document.write(html);
     document.close();
+    notifyAnnotationsRendered();
   };
   window.addEventListener('message', receivePreview);
   announce();

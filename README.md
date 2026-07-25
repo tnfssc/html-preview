@@ -19,6 +19,16 @@ Chrome extension for running and comparing commit-pinned public and private `.ht
 - Existing `githubToken` values from older releases are deleted automatically.
 - Exact-ref raw responses are packaged in the GitHub content script. No background file tabs are opened.
 
+## Preview annotations
+
+Pull-request previews support element-level review pins backed by ordinary PR conversation comments.
+
+- Select text in a rendered preview and choose **Comment** to draft a note. The extension opens GitHub's native composer prefilled with your text plus a hidden `<!-- gh-html-preview-anchor:… -->` payload; nothing posts until you submit it on GitHub.
+- Comments carrying that payload render as numbered pins on the anchored element in every matching file preview. Click a pin for an inline card with the author and excerpt, and jump straight to the GitHub comment.
+- Anchored comments on the conversation tab get a **Show in HTML preview** link that deep-links back: the files tab opens, scrolls the matching preview, and flashes the anchored element.
+- Anchors are a CSS-path plus text-quote pair, so they survive small document edits; anchors whose element disappears simply stop rendering a pin.
+- Metadata rides inside normal comments, so pins work for anyone with the extension and stay invisible to everyone else. Reading works for public repositories signed out; private repositories use the same signed-in session as preview packaging.
+
 ## Enterprise organization SSO
 
 Sign into GitHub and complete organization SSO in the same tab before opening Preview. No extension credential setup exists.

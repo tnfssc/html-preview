@@ -8,6 +8,7 @@ import { debugLog } from './debug';
 export interface RenderResult {
   iframe: HTMLIFrameElement;
   setScroll: (position: ScrollPosition) => void;
+  post: (message: Record<string, unknown>) => void;
   destroy: () => void;
 }
 
@@ -28,6 +29,7 @@ export interface RenderOptions {
   height?: string;
   title?: string;
   onScroll?: (position: ScrollPosition) => void;
+  onMessage?: (data: Record<string, unknown>) => void;
 }
 
 export function renderExecutablePreview(
@@ -92,6 +94,14 @@ export function renderExecutablePreview(
         y: clampRatio(data.y),
         anchor: parseScrollAnchor(data.anchor),
       });
+      return;
+    }
+    if (
+      typeof data.kind === 'string' &&
+      data.kind.startsWith('gh-html-preview:anchor') &&
+      data.channel === channel
+    ) {
+      options?.onMessage?.(data);
     }
   };
   window.addEventListener('message', receiveScroll);
@@ -101,6 +111,9 @@ export function renderExecutablePreview(
 
   return {
     iframe,
+    post: (message) => {
+      iframe.contentWindow?.postMessage({ ...message, channel }, '*');
+    },
     setScroll: (position) => {
       iframe.contentWindow?.postMessage(
         {

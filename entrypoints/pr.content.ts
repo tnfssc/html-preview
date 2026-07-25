@@ -19,6 +19,21 @@ import {
 import type { RepoRef } from '@/utils/types';
 import { debugError, debugLog } from '@/utils/debug';
 import { fetchWithRetry } from '@/utils/fetchWithRetry';
+import {
+  ANCHOR_ACTIVATE_MESSAGE,
+  ANCHOR_FOCUS_MESSAGE,
+  ANCHOR_FOCUSED_MESSAGE,
+  ANCHOR_PROPOSE_MESSAGE,
+  ANCHORS_MESSAGE,
+  ANCHORS_REQUEST_MESSAGE,
+  encodeAnchorComment,
+  type PreviewAnchor,
+} from '@/utils/annotations';
+import {
+  PullAnnotationSession,
+  encodeComposeHash,
+  injectConversationJumpButtons,
+} from '@/utils/prAnnotations';
 
 const PREVIEW_CONTROLS_CLASS = 'gh-html-preview-pr-controls';
 const RICH_CONTAINER_CLASS = 'gh-html-preview-pr-rich';
@@ -53,6 +68,8 @@ interface DiffRouteState {
   sessionPullData: Promise<Record<string, unknown> | null> | null;
   fallbackPromise: Promise<number> | null;
   readonly richDiffs: Set<RichDiffState>;
+  annotations: PullAnnotationSession | null;
+  pendingAnchorFocus: string | null;
 }
 
 class ExpectedMissingSideError extends Error {}
@@ -251,6 +268,7 @@ export default defineContentScript({
 
     const reconcileRoute = () => {
       const route = enabled ? parseHtmlDiffUrl(location.href) : null;
+      reconcileConversation();
       debugLog('pr', 'route-reconcile', {
         path: location.pathname,
         enabled,
@@ -279,9 +297,41 @@ export default defineContentScript({
           sessionPullData: null,
           fallbackPromise: null,
           richDiffs: new Set(),
+          annotations: null,
+          pendingAnchorFocus: null,
         };
+        if (route.kind === 'pull') {
+          const focusMatch = /^#ghp-anchor-(.+)$/.exec(location.hash);
+          state.pendingAnchorFocus = focusMatch?.[1] ?? null;
+          const session = new PullAnnotationSession({
+            owner: route.owner,
+            repo: route.repo,
+            pullNumber: route.pullNumber,
+          });
+          state.annotations = session;
+          const routeState = state;
+          session.onUpdate(() => pushAnnotations(routeState));
+          void session.refresh(controller.signal);
+        }
       }
       scheduleRender();
+    };
+
+    let conversationCleanup: (() => void) | null = null;
+    const reconcileConversation = () => {
+      conversationCleanup?.();
+      conversationCleanup = null;
+      if (!enabled) return;
+      const match = /^\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/.exec(
+        location.pathname,
+      );
+      if (match) {
+        conversationCleanup = injectConversationJumpButtons({
+          owner: decodeURIComponent(match[1]),
+          repo: decodeURIComponent(match[2]),
+          pullNumber: match[3],
+        });
+      }
     };
 
     const observer = new MutationObserver((mutations) => {
@@ -306,6 +356,17 @@ export default defineContentScript({
       lastLocation = location.href;
       reconcileRoute();
     });
+    ctx.addEventListener(window, 'focus', () => {
+      if (state?.annotations) {
+        void state.annotations.refresh(state.controller.signal);
+      }
+    });
+    const refreshTimer = window.setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      if (state?.annotations) {
+        void state.annotations.refresh(state.controller.signal);
+      }
+    }, 60_000);
     const unwatchEnabled = enabledStorage.watch((next) => {
       enabled = next;
       reconcileRoute();
@@ -323,6 +384,8 @@ export default defineContentScript({
     ctx.onInvalidated(() => {
       observer.disconnect();
       unwatchEnabled();
+      window.clearInterval(refreshTimer);
+      conversationCleanup?.();
       stopRoute();
     });
   },
@@ -1511,6 +1574,10 @@ async function renderComparisonSide(
     const render = renderExecutablePreview(area, result, {
       title: `${sideName === 'base' ? 'Before' : 'After'} HTML preview for ${state.target.path}`,
       onScroll,
+      onMessage:
+        sideName === 'head' && routeState.annotations
+          ? (data) => handleAnnotationMessage(routeState, state, data)
+          : undefined,
     });
     if (sideName === 'base') {
       state.baseRender?.destroy();
@@ -1518,6 +1585,7 @@ async function renderComparisonSide(
     } else {
       state.headRender?.destroy();
       state.headRender = render;
+      if (routeState.annotations) pushAnnotations(routeState);
     }
     return true;
   } catch (error) {
@@ -1539,6 +1607,193 @@ async function renderComparisonSide(
     });
     return false;
   }
+}
+
+function pushAnnotations(routeState: DiffRouteState): void {
+  const session = routeState.annotations;
+  if (!session || routeState.controller.signal.aborted) return;
+  for (const rich of routeState.richDiffs) {
+    rich.headRender?.post({
+      kind: ANCHORS_MESSAGE,
+      anchors: session.anchors.filter(
+        (comment) => comment.path === rich.target.path,
+      ),
+    });
+  }
+  deliverPendingFocus(routeState);
+}
+
+function deliverPendingFocus(routeState: DiffRouteState): void {
+  const id = routeState.pendingAnchorFocus;
+  if (!id || !routeState.annotations) return;
+  const comment = routeState.annotations.anchors.find(
+    (entry) => entry.id === id,
+  );
+  if (!comment) return;
+  const rich = Array.from(routeState.richDiffs).find(
+    (entry) => entry.target.path === comment.path && entry.headRender,
+  );
+  if (!rich?.headRender) return;
+  rich.container.scrollIntoView({ block: 'start' });
+  rich.headRender.post({ kind: ANCHOR_FOCUS_MESSAGE, id });
+  debugLog('pr', 'anchor-focus-posted', { id, path: comment.path });
+}
+
+function handleAnnotationMessage(
+  routeState: DiffRouteState,
+  rich: RichDiffState,
+  data: Record<string, unknown>,
+): void {
+  if (data.kind === ANCHORS_REQUEST_MESSAGE) {
+    pushAnnotations(routeState);
+    return;
+  }
+  if (data.kind === ANCHOR_FOCUSED_MESSAGE) {
+    if (routeState.pendingAnchorFocus === data.id) {
+      routeState.pendingAnchorFocus = null;
+    }
+    return;
+  }
+  if (data.kind === ANCHOR_PROPOSE_MESSAGE && data.anchor) {
+    openAnchorComposer(
+      routeState,
+      rich.target.path,
+      data.anchor as PreviewAnchor,
+    );
+    return;
+  }
+  if (data.kind === ANCHOR_ACTIVATE_MESSAGE && typeof data.id === 'string') {
+    const comment = routeState.annotations?.anchors.find(
+      (entry) => entry.id === data.id,
+    );
+    if (comment) {
+      window.open(comment.url, '_blank', 'noopener');
+    }
+  }
+}
+
+function openAnchorComposer(
+  routeState: DiffRouteState,
+  path: string,
+  anchor: PreviewAnchor,
+): void {
+  const session = routeState.annotations;
+  if (!session || !anchor || !Array.isArray(anchor.css)) return;
+  document.querySelector('.gh-html-preview-anchor-composer')?.remove();
+
+  const overlay = document.createElement('div');
+  overlay.className = 'gh-html-preview-anchor-composer';
+  Object.assign(overlay.style, {
+    position: 'fixed',
+    inset: '0',
+    background: 'rgba(0, 0, 0, 0.5)',
+    zIndex: '100000',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  });
+
+  const dialog = document.createElement('div');
+  Object.assign(dialog.style, {
+    background: 'var(--bgColor-default, #ffffff)',
+    color: 'var(--fgColor-default, #1f2328)',
+    borderRadius: '12px',
+    padding: '16px',
+    width: 'min(480px, 90vw)',
+    boxShadow: '0 16px 48px rgba(0, 0, 0, 0.4)',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '10px',
+    font: '14px/1.5 -apple-system, "Segoe UI", sans-serif',
+  });
+
+  const title = document.createElement('div');
+  title.textContent = `Comment on preview — ${path}`;
+  title.style.fontWeight = '600';
+
+  dialog.append(title);
+  if (anchor.kind === 'text-range' && anchor.quote) {
+    const context = document.createElement('div');
+    context.textContent = `"${anchor.quote}"`;
+    Object.assign(context.style, {
+      color: 'var(--fgColor-muted, #59636e)',
+      fontSize: '12px',
+      fontStyle: 'italic',
+      borderLeft: '3px solid var(--borderColor-muted, #d1d9e0)',
+      paddingLeft: '8px',
+    });
+    dialog.append(context);
+  }
+
+  const textarea = document.createElement('textarea');
+  textarea.rows = 4;
+  textarea.placeholder = 'Leave a comment…';
+  Object.assign(textarea.style, {
+    width: '100%',
+    boxSizing: 'border-box',
+    borderRadius: '6px',
+    border: '1px solid var(--borderColor-default, #d1d9e0)',
+    padding: '8px',
+    font: 'inherit',
+    resize: 'vertical',
+    background: 'var(--bgColor-default, #ffffff)',
+    color: 'inherit',
+  });
+
+  const status = document.createElement('div');
+  Object.assign(status.style, {
+    color: 'var(--fgColor-danger, #d1242f)',
+    fontSize: '12px',
+    minHeight: '16px',
+  });
+
+  const buttons = document.createElement('div');
+  Object.assign(buttons.style, {
+    display: 'flex',
+    gap: '8px',
+    justifyContent: 'flex-end',
+  });
+  const cancelButton = document.createElement('button');
+  cancelButton.className = 'btn';
+  cancelButton.type = 'button';
+  cancelButton.textContent = 'Cancel';
+  const submitButton = document.createElement('button');
+  submitButton.className = 'btn btn-primary';
+  submitButton.type = 'button';
+  submitButton.textContent = 'Comment';
+  buttons.append(cancelButton, submitButton);
+
+  dialog.append(textarea, status, buttons);
+  overlay.append(dialog);
+  document.body.append(overlay);
+  textarea.focus();
+
+  const close = () => overlay.remove();
+  cancelButton.addEventListener('click', close);
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay) close();
+  });
+  overlay.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') close();
+  });
+
+  submitButton.addEventListener('click', () => {
+    const text = textarea.value.trim();
+    if (!text) {
+      status.textContent = 'Write something first.';
+      return;
+    }
+    const body = `${text}\n\n${encodeAnchorComment({ v: 1, path, anchor })}`;
+    window.open(
+      `${session.conversationUrl()}${encodeComposeHash({ path, body })}`,
+      '_blank',
+      'noopener',
+    );
+    status.textContent =
+      'Finish posting in the GitHub tab that just opened; the pin appears here once the comment exists.';
+    status.style.color = 'var(--fgColor-muted, #59636e)';
+    submitButton.textContent = 'Open again';
+  });
 }
 
 async function getDiffComparison(

@@ -242,24 +242,35 @@ test('preview annotations render pins, popovers, deep links, and propose flow', 
       )
       .toBeGreaterThanOrEqual(2);
     await page.evaluate(() => window.scrollTo(0, 0));
-    // Click each diff card's Preview tab explicitly (scoped per region to avoid
-    // races with virtualized/late-materialized cards).
-    const regions = page.locator('[role="region"][id^="diff-"]');
-    await expect(regions).toHaveCount(2, { timeout: liveTimeout });
-    for (let i = 0; i < 2; i++) {
-      const region = regions.nth(i);
-      const previewTab = region.getByRole('tab', {
-        name: 'Display before and after previews',
-      });
-      await expect(previewTab).toBeVisible({ timeout: liveTimeout });
-      await previewTab.click();
-    }
-
+    // Synthetic fixture has no GitHub layout CSS. Dispatch directly so the
+    // first 500px preview cannot shift the second tab between pointer events;
+    // this test covers extension behavior, not browser hit testing.
+    const indexRegion = page.locator('#diff-index');
+    const indexPreviewTab = indexRegion.getByRole('tab', {
+      name: 'Display before and after previews',
+    });
+    await expect(indexPreviewTab).toBeVisible({ timeout: liveTimeout });
+    await indexPreviewTab.dispatchEvent('click');
+    await expect(indexPreviewTab).toHaveAttribute('aria-selected', 'true');
     const frame = page.frameLocator('iframe[title*="docs/index.html"]');
     const firstParagraph = frame
       .locator('p', { hasText: 'This paragraph explains the first concept' })
       .first();
     await expect(firstParagraph).toBeVisible({ timeout: liveTimeout });
+
+    const guideRegion = page.locator('#diff-guide');
+    const guidePreviewTab = guideRegion.getByRole('tab', {
+      name: 'Display before and after previews',
+    });
+    await expect(guidePreviewTab).toBeVisible({ timeout: liveTimeout });
+    await guidePreviewTab.dispatchEvent('click');
+    await expect(guidePreviewTab).toHaveAttribute('aria-selected', 'true');
+    const guideFrame = page.frameLocator('iframe[title*="docs/guide.html"]');
+    await expect(
+      guideFrame.locator('blockquote', {
+        hasText: 'this callout matters',
+      }),
+    ).toBeVisible({ timeout: liveTimeout });
 
     // 1. Pin from the pre-seeded anchored comment appears inside the preview.
     const pin = frame.getByRole('button', { name: '1', exact: true });
@@ -285,12 +296,6 @@ test('preview annotations render pins, popovers, deep links, and propose flow', 
 
     // 3. Anchors only land on their own file: the guide preview shows the
     //    guide pin anchored to its blockquote.
-    const guideFrame = page.frameLocator('iframe[title*="docs/guide.html"]');
-    await expect(
-      guideFrame.locator('blockquote', {
-        hasText: 'this callout matters',
-      }),
-    ).toBeVisible({ timeout: liveTimeout });
     const guidePin = guideFrame.getByRole('button', { name: '1', exact: true });
     await expect(guidePin).toBeVisible({ timeout: liveTimeout });
     expect(await guidePin.getAttribute('title')).toContain(

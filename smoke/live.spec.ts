@@ -74,7 +74,7 @@ test('current GitHub blob UI renders repository CSS in a sandboxed preview', asy
     expect((await iframe.boundingBox())?.height).toBeGreaterThanOrEqual(500);
 
     const folder = page.getByRole('treeitem', {
-      name: /^creating-hyperlinks$/,
+      name: /^getting-started$/,
     });
     await folder.focus();
     await page.keyboard.press('ArrowRight');
@@ -83,7 +83,7 @@ test('current GitHub blob UI renders repository CSS in a sandboxed preview', asy
     });
     await expect(nextFile).toBeVisible({ timeout: liveTimeout });
     await nextFile.click();
-    await expect(page).toHaveURL(/\/creating-hyperlinks\/index\.html$/);
+    await expect(page).toHaveURL(/\/getting-started\/index\.html$/);
 
     const refreshedFrame = page
       .locator(
@@ -91,9 +91,7 @@ test('current GitHub blob UI renders repository CSS in a sandboxed preview', asy
       )
       .contentFrame();
     await expect(
-      refreshedFrame.getByRole('heading', {
-        name: 'This is my sample homepage',
-      }),
+      refreshedFrame.getByText('This is my page'),
     ).toBeVisible({ timeout: liveTimeout });
     await expect(page.getByRole('tab', { name: 'Preview' })).toHaveCount(1, {
       timeout: liveTimeout,
